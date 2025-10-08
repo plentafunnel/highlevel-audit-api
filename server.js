@@ -4,6 +4,7 @@ import OpenAI from 'openai';
 import axios from 'axios';
 import dotenv from 'dotenv';
 import cors from 'cors';
+import { createClient } from '@supabase/supabase-js';
 
 dotenv.config();
 
@@ -22,10 +23,11 @@ const openai = new OpenAI({
 const HIGHLEVEL_API_KEY = process.env.HIGHLEVEL_API_KEY;
 const HIGHLEVEL_LOCATION_ID = process.env.HIGHLEVEL_LOCATION_ID;
 
-// In-memory storage (replace with real DB later)
-let promptsStorage = [];
-let analysesStorage = [];
-let contactsCache = [];
+// Initialize Supabase
+const supabase = createClient(
+  process.env.SUPABASE_URL,
+  process.env.SUPABASE_KEY
+);
 
 // ============================================
 // HEALTH CHECK
@@ -34,15 +36,18 @@ app.get('/health', (req, res) => {
   res.json({ 
     status: 'ok',
     message: 'HighLevel Audit API is running',
-    version: '2.1.0',
+    version: '2.2.0',
+    database: 'Supabase PostgreSQL',
     features: [
       'contacts',
       'conversations', 
       'transcriptions',
       'chat',
+      'chat-mcp',
       'audit',
       'prompts-management',
-      'full-contact-analysis'
+      'full-contact-analysis',
+      'persistent-storage'
     ]
   });
 });
@@ -51,13 +56,18 @@ app.get('/health', (req, res) => {
 // HIGHLEVEL DATA ENDPOINTS
 // ============================================
 
-// Get all contacts with cache
+// Get all contacts with Supabase cache
 app.get('/api/contacts', async (req, res) => {
   try {
     const { limit = 100, query, refresh = false } = req.query;
     
+    // Check if cache exists
+    const { count } = await supabase
+      .from('contacts_cache')
+      .select('*', { count: 'exact', head: true });
+    
     // If refresh or cache is empty, fetch from HighLevel
-    if (refresh === 'true' || contactsCache.length === 0) {
+    if (refresh === 'true' || count === 0) {
       const params = {
         locationId: HIGHLEVEL_LOCATION_ID,
         limit: parseInt(limit),
@@ -76,34 +86,50 @@ app.get('/api/contacts', async (req, res) => {
         }
       );
       
-      // Update cache
-      contactsCache = response.data.contacts.map(contact => ({
-        contactId: contact.id,
-        fullName: `${contact.firstName || ''} ${contact.lastName || ''}`.trim(),
+      // Update cache in Supabase
+      const contactsToCache = response.data.contacts.map(contact => ({
+        contact_id: contact.id,
+        full_name: `${contact.firstName || ''} ${contact.lastName || ''}`.trim(),
         email: contact.email,
         phone: contact.phone,
         tags: contact.tags,
-        lastSynced: new Date().toISOString(),
-        hasAnalysis: analysesStorage.some(a => a.contactId === contact.id)
+        last_synced: new Date().toISOString(),
       }));
+      
+      // Upsert contacts
+      if (contactsToCache.length > 0) {
+        await supabase
+          .from('contacts_cache')
+          .upsert(contactsToCache, { onConflict: 'contact_id' });
+      }
     }
     
-    // Filter if query provided
-    let filtered = contactsCache;
+    // Fetch from cache
+    let dbQuery = supabase
+      .from('contacts_cache')
+      .select('*')
+      .order('last_synced', { ascending: false });
+    
     if (query) {
-      const q = query.toLowerCase();
-      filtered = contactsCache.filter(c => 
-        c.fullName?.toLowerCase().includes(q) ||
-        c.email?.toLowerCase().includes(q) ||
-        c.phone?.includes(q) ||
-        c.contactId?.toLowerCase().includes(q)
-      );
+      dbQuery = dbQuery.or(`full_name.ilike.%${query}%,email.ilike.%${query}%,phone.ilike.%${query}%,contact_id.ilike.%${query}%`);
     }
+    
+    const { data: contacts, error } = await dbQuery.limit(parseInt(limit));
+    
+    if (error) throw error;
     
     res.json({
       success: true,
-      contacts: filtered,
-      total: filtered.length,
+      contacts: contacts.map(c => ({
+        contactId: c.contact_id,
+        fullName: c.full_name,
+        email: c.email,
+        phone: c.phone,
+        tags: c.tags,
+        lastSynced: c.last_synced,
+        hasAnalysis: c.has_analysis,
+      })),
+      total: contacts.length,
       cached: refresh !== 'true'
     });
   } catch (error) {
@@ -282,20 +308,44 @@ app.post('/api/transcribe', async (req, res) => {
 });
 
 // ============================================
-// PROMPTS MANAGEMENT
+// PROMPTS MANAGEMENT (Supabase)
 // ============================================
 
 // Get all prompts with history
-app.get('/api/prompts/history', (req, res) => {
+app.get('/api/prompts/history', async (req, res) => {
   try {
-    const sorted = promptsStorage.sort((a, b) => b.version - a.version);
+    const { data: prompts, error } = await supabase
+      .from('prompts')
+      .select('*')
+      .order('version', { ascending: false });
+    
+    if (error) throw error;
+    
+    const active = prompts.find(p => p.is_active);
     
     res.json({
       success: true,
-      prompts: sorted,
-      active: sorted.find(p => p.isActive),
+      prompts: prompts.map(p => ({
+        id: p.id,
+        version: p.version,
+        content: p.content,
+        settings: p.settings,
+        createdAt: p.created_at,
+        createdBy: p.created_by,
+        isActive: p.is_active,
+      })),
+      active: active ? {
+        id: active.id,
+        version: active.version,
+        content: active.content,
+        settings: active.settings,
+        createdAt: active.created_at,
+        createdBy: active.created_by,
+        isActive: active.is_active,
+      } : null,
     });
   } catch (error) {
+    console.error('Error getting prompts:', error.message);
     res.status(500).json({
       success: false,
       error: error.message,
@@ -304,23 +354,31 @@ app.get('/api/prompts/history', (req, res) => {
 });
 
 // Get active prompt
-app.get('/api/prompts/active', (req, res) => {
+app.get('/api/prompts/active', async (req, res) => {
   try {
-    const active = promptsStorage.find(p => p.isActive);
+    const { data, error } = await supabase
+      .from('prompts')
+      .select('*')
+      .eq('is_active', true)
+      .single();
     
-    if (!active) {
-      return res.json({
-        success: true,
-        prompt: null,
-        message: 'No active prompt set'
-      });
-    }
+    if (error && error.code !== 'PGRST116') throw error;
     
     res.json({
       success: true,
-      prompt: active,
+      prompt: data ? {
+        id: data.id,
+        version: data.version,
+        content: data.content,
+        settings: data.settings,
+        createdAt: data.created_at,
+        createdBy: data.created_by,
+        isActive: data.is_active,
+      } : null,
+      message: data ? null : 'No active prompt set'
     });
   } catch (error) {
+    console.error('Error getting active prompt:', error.message);
     res.status(500).json({
       success: false,
       error: error.message,
@@ -329,7 +387,7 @@ app.get('/api/prompts/active', (req, res) => {
 });
 
 // Save new prompt version
-app.post('/api/prompts', (req, res) => {
+app.post('/api/prompts', async (req, res) => {
   try {
     const { content, settings, createdBy } = req.body;
     
@@ -340,36 +398,55 @@ app.post('/api/prompts', (req, res) => {
       });
     }
     
-    // Deactivate all previous prompts
-    promptsStorage.forEach(p => p.isActive = false);
+    // Get max version
+    const { data: maxData } = await supabase
+      .from('prompts')
+      .select('version')
+      .order('version', { ascending: false })
+      .limit(1)
+      .single();
     
-    // Get next version number
-    const maxVersion = promptsStorage.length > 0 
-      ? Math.max(...promptsStorage.map(p => p.version))
-      : 0;
+    const nextVersion = (maxData?.version || 0) + 1;
     
-    const newPrompt = {
-      id: `prompt_${Date.now()}`,
-      version: maxVersion + 1,
-      content,
-      settings: settings || {
-        includeContactInfo: true,
-        includeWhatsApp: true,
-        includeSMS: true,
-        includeCalls: true,
-        model: 'claude-sonnet-4-5-20250929',
-        language: 'es'
-      },
-      createdAt: new Date().toISOString(),
-      createdBy: createdBy || 'user',
-      isActive: true,
-    };
+    // Deactivate all prompts
+    await supabase
+      .from('prompts')
+      .update({ is_active: false })
+      .eq('is_active', true);
     
-    promptsStorage.push(newPrompt);
+    // Insert new prompt
+    const { data: newPrompt, error } = await supabase
+      .from('prompts')
+      .insert({
+        version: nextVersion,
+        content,
+        settings: settings || {
+          includeContactInfo: true,
+          includeWhatsApp: true,
+          includeSMS: true,
+          includeCalls: true,
+          model: 'claude-sonnet-4-5-20250929',
+          language: 'es'
+        },
+        created_by: createdBy || 'user',
+        is_active: true,
+      })
+      .select()
+      .single();
+    
+    if (error) throw error;
     
     res.json({
       success: true,
-      prompt: newPrompt,
+      prompt: {
+        id: newPrompt.id,
+        version: newPrompt.version,
+        content: newPrompt.content,
+        settings: newPrompt.settings,
+        createdAt: newPrompt.created_at,
+        createdBy: newPrompt.created_by,
+        isActive: newPrompt.is_active,
+      },
       message: `Prompt v${newPrompt.version} saved and activated`
     });
   } catch (error) {
@@ -382,29 +459,46 @@ app.post('/api/prompts', (req, res) => {
 });
 
 // Restore a specific prompt version
-app.post('/api/prompts/:id/restore', (req, res) => {
+app.post('/api/prompts/:id/restore', async (req, res) => {
   try {
-    const promptToRestore = promptsStorage.find(p => p.id === req.params.id);
+    // Deactivate all
+    await supabase
+      .from('prompts')
+      .update({ is_active: false })
+      .eq('is_active', true);
     
-    if (!promptToRestore) {
+    // Activate selected
+    const { data: restored, error } = await supabase
+      .from('prompts')
+      .update({ is_active: true })
+      .eq('id', req.params.id)
+      .select()
+      .single();
+    
+    if (error) throw error;
+    
+    if (!restored) {
       return res.status(404).json({
         success: false,
         error: 'Prompt not found'
       });
     }
     
-    // Deactivate all prompts
-    promptsStorage.forEach(p => p.isActive = false);
-    
-    // Activate the selected one
-    promptToRestore.isActive = true;
-    
     res.json({
       success: true,
-      prompt: promptToRestore,
-      message: `Prompt v${promptToRestore.version} restored and activated`
+      prompt: {
+        id: restored.id,
+        version: restored.version,
+        content: restored.content,
+        settings: restored.settings,
+        createdAt: restored.created_at,
+        createdBy: restored.created_by,
+        isActive: restored.is_active,
+      },
+      message: `Prompt v${restored.version} restored and activated`
     });
   } catch (error) {
+    console.error('Error restoring prompt:', error.message);
     res.status(500).json({
       success: false,
       error: error.message,
@@ -413,23 +507,39 @@ app.post('/api/prompts/:id/restore', (req, res) => {
 });
 
 // Delete a prompt version
-app.delete('/api/prompts/:id', (req, res) => {
+app.delete('/api/prompts/:id', async (req, res) => {
   try {
-    const index = promptsStorage.findIndex(p => p.id === req.params.id);
+    const { data: deleted, error } = await supabase
+      .from('prompts')
+      .delete()
+      .eq('id', req.params.id)
+      .select()
+      .single();
     
-    if (index === -1) {
+    if (error) throw error;
+    
+    if (!deleted) {
       return res.status(404).json({
         success: false,
         error: 'Prompt not found'
       });
     }
     
-    const deleted = promptsStorage.splice(index, 1)[0];
-    
     // If deleted was active, activate the latest
-    if (deleted.isActive && promptsStorage.length > 0) {
-      const latest = promptsStorage.sort((a, b) => b.version - a.version)[0];
-      latest.isActive = true;
+    if (deleted.is_active) {
+      const { data: latest } = await supabase
+        .from('prompts')
+        .select('*')
+        .order('version', { ascending: false })
+        .limit(1)
+        .single();
+      
+      if (latest) {
+        await supabase
+          .from('prompts')
+          .update({ is_active: true })
+          .eq('id', latest.id);
+      }
     }
     
     res.json({
@@ -437,6 +547,7 @@ app.delete('/api/prompts/:id', (req, res) => {
       message: `Prompt v${deleted.version} deleted`
     });
   } catch (error) {
+    console.error('Error deleting prompt:', error.message);
     res.status(500).json({
       success: false,
       error: error.message,
@@ -445,7 +556,7 @@ app.delete('/api/prompts/:id', (req, res) => {
 });
 
 // ============================================
-// FULL CONTACT ANALYSIS
+// FULL CONTACT ANALYSIS (Supabase)
 // ============================================
 
 app.post('/api/analyze-contact', async (req, res) => {
@@ -470,9 +581,19 @@ app.post('/api/analyze-contact', async (req, res) => {
     // Get prompt (use provided or active)
     let prompt;
     if (promptId) {
-      prompt = promptsStorage.find(p => p.id === promptId);
+      const { data } = await supabase
+        .from('prompts')
+        .select('*')
+        .eq('id', promptId)
+        .single();
+      prompt = data;
     } else {
-      prompt = promptsStorage.find(p => p.isActive);
+      const { data } = await supabase
+        .from('prompts')
+        .select('*')
+        .eq('is_active', true)
+        .single();
+      prompt = data;
     }
     
     if (!prompt) {
@@ -636,36 +757,42 @@ app.post('/api/analyze-contact', async (req, res) => {
     
     const analysisText = claudeResponse.content[0].text;
     
-    // 6. Save analysis
-    const analysis = {
-      id: `analysis_${Date.now()}`,
-      contactId,
-      contactName: `${contact.firstName} ${contact.lastName}`,
-      promptVersion: prompt.version,
-      promptId: prompt.id,
-      analysisText,
-      transcriptions,
-      metadata: {
-        totalMessages: allMessages.length,
-        totalCalls: transcriptions.length,
-        analysisDate: new Date().toISOString(),
-      },
-      createdAt: new Date().toISOString(),
-    };
+    // 6. Save analysis to Supabase
+    const { data: savedAnalysis, error: saveError } = await supabase
+      .from('analyses')
+      .insert({
+        contact_id: contactId,
+        contact_name: `${contact.firstName} ${contact.lastName}`,
+        prompt_version: prompt.version,
+        prompt_id: prompt.id,
+        analysis_text: analysisText,
+        transcriptions: transcriptions,
+        metadata: {
+          totalMessages: allMessages.length,
+          totalCalls: transcriptions.length,
+          analysisDate: new Date().toISOString(),
+        },
+      })
+      .select()
+      .single();
     
-    analysesStorage.push(analysis);
+    if (saveError) throw saveError;
     
-    // Update cache
-    const cachedContact = contactsCache.find(c => c.contactId === contactId);
-    if (cachedContact) {
-      cachedContact.hasAnalysis = true;
-    }
-    
-    console.log('Analysis completed successfully');
+    console.log('Analysis completed and saved successfully');
     
     res.json({
       success: true,
-      analysis,
+      analysis: {
+        id: savedAnalysis.id,
+        contactId: savedAnalysis.contact_id,
+        contactName: savedAnalysis.contact_name,
+        promptVersion: savedAnalysis.prompt_version,
+        promptId: savedAnalysis.prompt_id,
+        analysisText: savedAnalysis.analysis_text,
+        transcriptions: savedAnalysis.transcriptions,
+        metadata: savedAnalysis.metadata,
+        createdAt: savedAnalysis.created_at,
+      },
     });
     
   } catch (error) {
@@ -679,27 +806,35 @@ app.post('/api/analyze-contact', async (req, res) => {
 });
 
 // Get latest analysis for a contact
-app.get('/api/analyses/:contactId/latest', (req, res) => {
+app.get('/api/analyses/:contactId/latest', async (req, res) => {
   try {
-    const analyses = analysesStorage.filter(a => a.contactId === req.params.contactId);
+    const { data, error } = await supabase
+      .from('analyses')
+      .select('*')
+      .eq('contact_id', req.params.contactId)
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .single();
     
-    if (analyses.length === 0) {
-      return res.json({
-        success: true,
-        analysis: null,
-        message: 'No analysis found for this contact'
-      });
-    }
-    
-    const latest = analyses.sort((a, b) => 
-      new Date(b.createdAt) - new Date(a.createdAt)
-    )[0];
+    if (error && error.code !== 'PGRST116') throw error;
     
     res.json({
       success: true,
-      analysis: latest,
+      analysis: data ? {
+        id: data.id,
+        contactId: data.contact_id,
+        contactName: data.contact_name,
+        promptVersion: data.prompt_version,
+        promptId: data.prompt_id,
+        analysisText: data.analysis_text,
+        transcriptions: data.transcriptions,
+        metadata: data.metadata,
+        createdAt: data.created_at,
+      } : null,
+      message: data ? null : 'No analysis found for this contact'
     });
   } catch (error) {
+    console.error('Error getting latest analysis:', error.message);
     res.status(500).json({
       success: false,
       error: error.message,
@@ -708,20 +843,33 @@ app.get('/api/analyses/:contactId/latest', (req, res) => {
 });
 
 // Get all analyses for a contact
-app.get('/api/analyses/:contactId', (req, res) => {
+app.get('/api/analyses/:contactId', async (req, res) => {
   try {
-    const analyses = analysesStorage.filter(a => a.contactId === req.params.contactId);
+    const { data: analyses, error } = await supabase
+      .from('analyses')
+      .select('*')
+      .eq('contact_id', req.params.contactId)
+      .order('created_at', { ascending: false });
     
-    const sorted = analyses.sort((a, b) => 
-      new Date(b.createdAt) - new Date(a.createdAt)
-    );
+    if (error) throw error;
     
     res.json({
       success: true,
-      analyses: sorted,
-      total: sorted.length,
+      analyses: analyses.map(a => ({
+        id: a.id,
+        contactId: a.contact_id,
+        contactName: a.contact_name,
+        promptVersion: a.prompt_version,
+        promptId: a.prompt_id,
+        analysisText: a.analysis_text,
+        transcriptions: a.transcriptions,
+        metadata: a.metadata,
+        createdAt: a.created_at,
+      })),
+      total: analyses.length,
     });
   } catch (error) {
+    console.error('Error getting analyses:', error.message);
     res.status(500).json({
       success: false,
       error: error.message,
@@ -729,16 +877,13 @@ app.get('/api/analyses/:contactId', (req, res) => {
   }
 });
 
-// Re-analyze contact with a specific prompt
+// Re-analyze contact
 app.post('/api/analyses/:contactId/reanalyze', async (req, res) => {
   try {
     const { promptId } = req.body;
     
-    // Just call analyze-contact with the same parameters
-    return app._router.handle({
-      ...req,
-      url: '/api/analyze-contact',
-      method: 'POST',
+    // Call analyze-contact endpoint
+    const analysisReq = {
       body: {
         contactId: req.params.contactId,
         promptId,
@@ -746,9 +891,16 @@ app.post('/api/analyses/:contactId/reanalyze', async (req, res) => {
         includeSMS: true,
         includeCalls: true,
       }
-    }, res);
+    };
+    
+    // Redirect to analyze-contact
+    return app._router.handle(
+      { ...req, url: '/api/analyze-contact', method: 'POST', body: analysisReq.body },
+      res
+    );
     
   } catch (error) {
+    console.error('Error reanalyzing contact:', error.message);
     res.status(500).json({
       success: false,
       error: error.message,
@@ -757,7 +909,7 @@ app.post('/api/analyses/:contactId/reanalyze', async (req, res) => {
 });
 
 // ============================================
-// FLEXIBLE CHAT ENDPOINT (MCP Integration)
+// FLEXIBLE CHAT ENDPOINT
 // ============================================
 
 app.post('/api/chat', async (req, res) => {
@@ -822,7 +974,7 @@ app.post('/api/chat', async (req, res) => {
 });
 
 // ============================================
-// MCP-ENABLED CHAT (Claude con herramientas)
+// MCP-ENABLED CHAT
 // ============================================
 
 // Define MCP tools for Claude
@@ -1168,12 +1320,14 @@ app.post('/api/chat-mcp', async (req, res) => {
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, '0.0.0.0', () => {
-  console.log(`🚀 HighLevel Audit API v2.1 running on port ${PORT}`);
+  console.log(`🚀 HighLevel Audit API v2.2 running on port ${PORT}`);
   console.log(`📍 Health: http://localhost:${PORT}/health`);
-  console.log(`🎯 New Features:`);
-  console.log(`   - Prompts Management with versioning`);
-  console.log(`   - Full Contact Analysis (WhatsApp + SMS + Calls)`);
+  console.log(`💾 Database: Supabase PostgreSQL`);
+  console.log(`🎯 Features:`);
+  console.log(`   - Persistent storage with Supabase`);
+  console.log(`   - Prompts management with versioning`);
+  console.log(`   - Full contact analysis`);
+  console.log(`   - MCP-enabled intelligent chat`);
   console.log(`   - Contacts caching`);
   console.log(`   - Analysis history`);
 });
-

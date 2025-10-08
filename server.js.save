@@ -1,105 +1,247 @@
-  }
-);
+import express from 'express';
+import Anthropic from '@anthropic-ai/sdk';
+import OpenAI from 'openai';
+import axios from 'axios';
+import dotenv from 'dotenv';
+import cors from 'cors';
 
-// Herramienta para obtener contactos
-server.setRequestHandler('tools/list', async () => {
-  return {
-    tools: [
-      {
-        name: 'get_contacts',
-        description: 'Obtiene la lista de contactos de HighLevel',
-        inputSchema: {
-          type: 'object',
-          properties: {
-            limit: {
-              type: 'number',
-              description: 'Número de contactos a obtener (máximo 100)',
-            },
-          },
-        },
-      },
-      {
-        name: 'get_contact',
-        description: 'Obtiene información de un contacto específico',
-        inputSchema: {
-          type: 'object',
-          properties: {
-            contactId: {
-              type: 'string',
-              description: 'ID del contacto',
-            },
-          },
-          required: ['contactId'],
-        },
-      },
-    ],
-  };
+dotenv.config();
+
+const app = express();
+app.use(express.json());
+app.use(cors());
+
+const anthropic = new Anthropic({
+  apiKey: process.env.ANTHROPIC_API_KEY,
 });
 
-server.setRequestHandler('tools/call', async (request) => {
-  const { name, arguments: args } = request.params;
+const openai = new OpenAI({
+  apiKey: process.env.OPENAI_API_KEY,
+});
 
+const HIGHLEVEL_API_KEY = process.env.HIGHLEVEL_API_KEY;
+const HIGHLEVEL_LOCATION_ID = process.env.HIGHLEVEL_LOCATION_ID;
+
+// Health check endpoint
+app.get('/health', (req, res) => {
+  res.json({ 
+    status: 'ok',
+    message: 'HighLevel Audit API is running',
+    version: '1.0.0'
+  });
+});
+
+// Get contacts
+app.get('/api/contacts', async (req, res) => {
   try {
-    if (name === 'get_contacts') {
-      const limit = args.limit || 10;
-      const response = await axios.get(
-        `https://rest.gohighlevel.com/v1/contacts/`,
-        {
-          headers: {
-            Authorization: `Bearer ${HIGHLEVEL_API_KEY}`,
-          },
-          params: {
-            locationId: HIGHLEVEL_LOCATION_ID,
-            limit: limit,
-          },
-        }
-      );
-
-      return {
-        content: [
-          {
-            type: 'text',
-            text: JSON.stringify(response.data, null, 2),
-          },
-        ],
-      };
-    }
-
-    if (name === 'get_contact') {
-      const response = await axios.get(
-        `https://rest.gohighlevel.com/v1/contacts/${args.contactId}`,
-        {
-          headers: {
-            Authorization: `Bearer ${HIGHLEVEL_API_KEY}`,
-          },
-        }
-      );
-
-      return {
-        content: [
-          {
-            type: 'text',
-            text: JSON.stringify(response.data, null, 2),
-          },
-        ],
-      };
-    }
-  } catch (error) {
-    return {
-      content: [
-        {
-          type: 'text',
-          text: `Error: ${error.message}`,
+    const limit = req.query.limit || 20;
+    const response = await axios.get(
+      'https://services.leadconnectorhq.com/contacts/',
+      {
+        headers: {
+          Authorization: `Bearer ${HIGHLEVEL_API_KEY}`,
+          Version: '2021-07-28',
         },
-      ],
-      isError: true,
-    };
+        params: {
+          locationId: HIGHLEVEL_LOCATION_ID,
+          limit: limit,
+        },
+      }
+    );
+    
+    res.json({
+      success: true,
+      contacts: response.data.contacts,
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      error: error.message,
+    });
   }
 });
 
-async function main() {
-  const transport = new StdioServerTransport();
-  await server.connect(transport);
-}
+// Audit call - Main endpoint
+app.post('/api/audit', async (req, res) => {
+  try {
+    const { messageId, contactId, customPrompt, userId } = req.body;
+    
+    console.log(`Starting audit for message: ${messageId}, contact: ${contactId}`);
+    
+    // 1. Get contact info
+    const contactResponse = await axios.get(
+      `https://services.leadconnectorhq.com/contacts/${contactId}`,
+      {
+        headers: {
+          Authorization: `Bearer ${HIGHLEVEL_API_KEY}`,
+          Version: '2021-07-28',
+        },
+      }
+    );
+    const contact = contactResponse.data.contact;
+    
+    // 2. Download recording
+    const recordingUrl = `https://services.leadconnectorhq.com/conversations/messages/${messageId}/locations/${HIGHLEVEL_LOCATION_ID}/recording`;
+    console.log(`Downloading recording from: ${recordingUrl}`);
+    
+    const audioResponse = await axios.get(recordingUrl, {
+      headers: {
+        Authorization: `Bearer ${HIGHLEVEL_API_KEY}`,
+        Version: '2021-07-28',
+      },
+      responseType: 'arraybuffer',
+      maxContentLength: 25 * 1024 * 1024,
+      timeout: 90000,
+    });
+    
+    console.log(`Audio downloaded: ${(audioResponse.data.length / (1024 * 1024)).toFixed(2)}MB`);
+    
+    // 3. Transcribe with Whisper
+    const audioBuffer = Buffer.from(audioResponse.data);
+    const audioFile = new File([audioBuffer], 'recording.mp3', { type: 'audio/mpeg' });
+    
+    console.log('Transcribing with Whisper...');
+    const transcription = await openai.audio.transcriptions.create({
+      file: audioFile,
+      model: 'whisper-1',
+      language: 'es',
+      response_format: 'verbose_json',
+    });
+    
+    console.log('Transcription completed');
+    
+    // 4. Audit with Claude
+    const defaultPrompt = `Eres un auditor experto de llamadas de ventas. Analiza esta llamada y proporciona:
 
-main();
+1. **Fortalezas del closer** - Qué hizo bien
+2. **Áreas de mejora** - Qué puede mejorar
+3. **Técnicas de venta utilizadas** - Identifica las técnicas
+4. **Manejo de objeciones** - Cómo manejó las objeciones
+5. **Recomendaciones específicas** - Pasos concretos para mejorar
+
+Sé específico, directo y constructivo.`;
+
+    const prompt = customPrompt || defaultPrompt;
+    
+    console.log('Sending to Claude for audit...');
+    const message = await anthropic.messages.create({
+      model: 'claude-sonnet-4-5-20250929',
+      max_tokens: 4000,
+      messages: [{
+        role: 'user',
+        content: `${prompt}
+
+**INFORMACIÓN DEL CONTACTO:**
+- Nombre: ${contact.firstName} ${contact.lastName}
+- Email: ${contact.email || 'No disponible'}
+- Teléfono: ${contact.phone || 'No disponible'}
+
+**DURACIÓN DE LA LLAMADA:** ${Math.floor(transcription.duration / 60)} minutos ${Math.floor(transcription.duration % 60)} segundos
+
+**TRANSCRIPCIÓN DE LA LLAMADA:**
+${transcription.text}
+
+Por favor, realiza una auditoría detallada de esta llamada.`
+      }]
+    });
+    
+    const auditResult = message.content[0].text;
+    console.log('Audit completed successfully');
+    
+    res.json({
+      success: true,
+      messageId: messageId,
+      contactId: contactId,
+      contact: {
+        name: `${contact.firstName} ${contact.lastName}`,
+        email: contact.email,
+        phone: contact.phone,
+      },
+      transcription: transcription.text,
+      duration: transcription.duration,
+      audit: auditResult,
+      usage: {
+        inputTokens: message.usage.input_tokens,
+        outputTokens: message.usage.output_tokens,
+      },
+    });
+    
+  } catch (error) {
+    console.error('Error auditando llamada:', error.message);
+    res.status(500).json({
+      success: false,
+      error: error.message,
+      stack: error.stack,
+    });
+  }
+});
+
+// Chat endpoint
+app.post('/api/chat', async (req, res) => {
+  try {
+    const { message, contactId, conversationHistory, userId } = req.body;
+    
+    let contactInfo = '';
+    if (contactId) {
+      const response = await axios.get(
+        `https://services.leadconnectorhq.com/contacts/${contactId}`,
+        {
+          headers: {
+            Authorization: `Bearer ${HIGHLEVEL_API_KEY}`,
+            Version: '2021-07-28',
+          },
+        }
+      );
+      const contact = response.data.contact;
+      contactInfo = `\n\n**Información del contacto actual:**
+- Nombre: ${contact.firstName} ${contact.lastName}
+- Email: ${contact.email || 'No disponible'}
+- Teléfono: ${contact.phone || 'No disponible'}`;
+    }
+    
+    const messages = conversationHistory || [];
+    messages.push({
+      role: 'user',
+      content: message + contactInfo,
+    });
+    
+    const response = await anthropic.messages.create({
+      model: 'claude-sonnet-4-5-20250929',
+      max_tokens: 2000,
+      system: `Eres un asistente experto en análisis de llamadas de ventas y gestión de leads en HighLevel. 
+      
+Puedes ayudar con:
+- Auditar llamadas de ventas
+- Analizar conversaciones
+- Dar recomendaciones para closers
+- Interpretar datos de contactos
+
+Sé directo, práctico y profesional.`,
+      messages: messages,
+    });
+    
+    res.json({
+      success: true,
+      response: response.content[0].text,
+      conversationHistory: [
+        ...messages,
+        {
+          role: 'assistant',
+          content: response.content[0].text,
+        }
+      ],
+    });
+    
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      error: error.message,
+    });
+  }
+});
+
+// Start server
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(`🚀 HighLevel Audit API running on port ${PORT}`);
+  console.log(`📍 Health check: http://localhost:${PORT}/health`);
