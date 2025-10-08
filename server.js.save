@@ -1,0 +1,105 @@
+  }
+);
+
+// Herramienta para obtener contactos
+server.setRequestHandler('tools/list', async () => {
+  return {
+    tools: [
+      {
+        name: 'get_contacts',
+        description: 'Obtiene la lista de contactos de HighLevel',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            limit: {
+              type: 'number',
+              description: 'Número de contactos a obtener (máximo 100)',
+            },
+          },
+        },
+      },
+      {
+        name: 'get_contact',
+        description: 'Obtiene información de un contacto específico',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            contactId: {
+              type: 'string',
+              description: 'ID del contacto',
+            },
+          },
+          required: ['contactId'],
+        },
+      },
+    ],
+  };
+});
+
+server.setRequestHandler('tools/call', async (request) => {
+  const { name, arguments: args } = request.params;
+
+  try {
+    if (name === 'get_contacts') {
+      const limit = args.limit || 10;
+      const response = await axios.get(
+        `https://rest.gohighlevel.com/v1/contacts/`,
+        {
+          headers: {
+            Authorization: `Bearer ${HIGHLEVEL_API_KEY}`,
+          },
+          params: {
+            locationId: HIGHLEVEL_LOCATION_ID,
+            limit: limit,
+          },
+        }
+      );
+
+      return {
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify(response.data, null, 2),
+          },
+        ],
+      };
+    }
+
+    if (name === 'get_contact') {
+      const response = await axios.get(
+        `https://rest.gohighlevel.com/v1/contacts/${args.contactId}`,
+        {
+          headers: {
+            Authorization: `Bearer ${HIGHLEVEL_API_KEY}`,
+          },
+        }
+      );
+
+      return {
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify(response.data, null, 2),
+          },
+        ],
+      };
+    }
+  } catch (error) {
+    return {
+      content: [
+        {
+          type: 'text',
+          text: `Error: ${error.message}`,
+        },
+      ],
+      isError: true,
+    };
+  }
+});
+
+async function main() {
+  const transport = new StdioServerTransport();
+  await server.connect(transport);
+}
+
+main();
