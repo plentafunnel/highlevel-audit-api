@@ -822,6 +822,347 @@ app.post('/api/chat', async (req, res) => {
 });
 
 // ============================================
+// MCP-ENABLED CHAT (Claude con herramientas)
+// ============================================
+
+// Define MCP tools for Claude
+const mcpTools = [
+  {
+    name: "get_contacts",
+    description: "Obtiene la lista de contactos de HighLevel. Puedes filtrar por query, limitar resultados, etc.",
+    input_schema: {
+      type: "object",
+      properties: {
+        limit: {
+          type: "number",
+          description: "Número de contactos a obtener (default: 20)"
+        },
+        query: {
+          type: "string",
+          description: "Búsqueda por nombre, email o teléfono"
+        }
+      }
+    }
+  },
+  {
+    name: "get_contact",
+    description: "Obtiene información detallada de un contacto específico por ID",
+    input_schema: {
+      type: "object",
+      properties: {
+        contactId: {
+          type: "string",
+          description: "ID del contacto"
+        }
+      },
+      required: ["contactId"]
+    }
+  },
+  {
+    name: "get_conversations",
+    description: "Obtiene las conversaciones de un contacto específico",
+    input_schema: {
+      type: "object",
+      properties: {
+        contactId: {
+          type: "string",
+          description: "ID del contacto"
+        },
+        limit: {
+          type: "number",
+          description: "Número de conversaciones a obtener"
+        }
+      },
+      required: ["contactId"]
+    }
+  },
+  {
+    name: "get_conversation_messages",
+    description: "Obtiene los mensajes de una conversación específica",
+    input_schema: {
+      type: "object",
+      properties: {
+        conversationId: {
+          type: "string",
+          description: "ID de la conversación"
+        },
+        limit: {
+          type: "number",
+          description: "Número de mensajes a obtener"
+        }
+      },
+      required: ["conversationId"]
+    }
+  },
+  {
+    name: "transcribe_recording",
+    description: "Transcribe una grabación de llamada usando Whisper",
+    input_schema: {
+      type: "object",
+      properties: {
+        messageId: {
+          type: "string",
+          description: "ID del mensaje que contiene la grabación"
+        }
+      },
+      required: ["messageId"]
+    }
+  }
+];
+
+// Execute MCP tool
+async function executeMCPTool(toolName, toolInput) {
+  console.log(`Executing MCP tool: ${toolName}`, toolInput);
+  
+  try {
+    switch (toolName) {
+      case "get_contacts": {
+        const { limit = 20, query } = toolInput;
+        const params = {
+          locationId: HIGHLEVEL_LOCATION_ID,
+          limit: parseInt(limit),
+        };
+        if (query) params.query = query;
+        
+        const response = await axios.get(
+          'https://services.leadconnectorhq.com/contacts/',
+          {
+            headers: {
+              Authorization: `Bearer ${HIGHLEVEL_API_KEY}`,
+              Version: '2021-07-28',
+            },
+            params,
+          }
+        );
+        
+        return {
+          contacts: response.data.contacts.map(c => ({
+            id: c.id,
+            name: `${c.firstName || ''} ${c.lastName || ''}`.trim(),
+            email: c.email,
+            phone: c.phone,
+            tags: c.tags,
+            dateAdded: c.dateAdded,
+          })),
+          total: response.data.total,
+        };
+      }
+      
+      case "get_contact": {
+        const { contactId } = toolInput;
+        const response = await axios.get(
+          `https://services.leadconnectorhq.com/contacts/${contactId}`,
+          {
+            headers: {
+              Authorization: `Bearer ${HIGHLEVEL_API_KEY}`,
+              Version: '2021-07-28',
+            },
+          }
+        );
+        
+        const contact = response.data.contact;
+        return {
+          id: contact.id,
+          name: `${contact.firstName || ''} ${contact.lastName || ''}`.trim(),
+          email: contact.email,
+          phone: contact.phone,
+          tags: contact.tags,
+          source: contact.source,
+          dateAdded: contact.dateAdded,
+          customFields: contact.customFields,
+        };
+      }
+      
+      case "get_conversations": {
+        const { contactId, limit = 50 } = toolInput;
+        const response = await axios.get(
+          'https://services.leadconnectorhq.com/conversations/search',
+          {
+            headers: {
+              Authorization: `Bearer ${HIGHLEVEL_API_KEY}`,
+              Version: '2021-07-28',
+            },
+            params: {
+              locationId: HIGHLEVEL_LOCATION_ID,
+              contactId: contactId,
+              limit: parseInt(limit),
+            },
+          }
+        );
+        
+        return {
+          conversations: response.data.conversations || [],
+          total: response.data.conversations?.length || 0,
+        };
+      }
+      
+      case "get_conversation_messages": {
+        const { conversationId, limit = 100 } = toolInput;
+        const response = await axios.get(
+          `https://services.leadconnectorhq.com/conversations/${conversationId}/messages`,
+          {
+            headers: {
+              Authorization: `Bearer ${HIGHLEVEL_API_KEY}`,
+              Version: '2021-07-28',
+            },
+            params: {
+              limit: parseInt(limit),
+            },
+          }
+        );
+        
+        return {
+          messages: response.data.messages || [],
+          total: response.data.messages?.length || 0,
+        };
+      }
+      
+      case "transcribe_recording": {
+        const { messageId } = toolInput;
+        const recordingUrl = `https://services.leadconnectorhq.com/conversations/messages/${messageId}/locations/${HIGHLEVEL_LOCATION_ID}/recording`;
+        
+        const audioResponse = await axios.get(recordingUrl, {
+          headers: {
+            Authorization: `Bearer ${HIGHLEVEL_API_KEY}`,
+            Version: '2021-07-28',
+          },
+          responseType: 'arraybuffer',
+          maxContentLength: 25 * 1024 * 1024,
+          timeout: 90000,
+        });
+        
+        const audioBuffer = Buffer.from(audioResponse.data);
+        const audioFile = new File([audioBuffer], 'recording.mp3', { type: 'audio/mpeg' });
+        
+        const transcription = await openai.audio.transcriptions.create({
+          file: audioFile,
+          model: 'whisper-1',
+          language: 'es',
+        });
+        
+        return {
+          transcription: transcription.text,
+          duration: transcription.duration,
+        };
+      }
+      
+      default:
+        throw new Error(`Unknown tool: ${toolName}`);
+    }
+  } catch (error) {
+    console.error(`Error executing ${toolName}:`, error.message);
+    return {
+      error: error.message,
+    };
+  }
+}
+
+// Chat endpoint with MCP tools
+app.post('/api/chat-mcp', async (req, res) => {
+  try {
+    const { message, conversationHistory = [] } = req.body;
+    
+    if (!message) {
+      return res.status(400).json({
+        success: false,
+        error: 'message is required'
+      });
+    }
+    
+    console.log(`MCP Chat request: "${message}"`);
+    
+    // Build messages array
+    const messages = [
+      ...conversationHistory,
+      {
+        role: "user",
+        content: message
+      }
+    ];
+    
+    // Initial request to Claude with tools
+    let response = await anthropic.messages.create({
+      model: "claude-sonnet-4-5-20250929",
+      max_tokens: 4000,
+      tools: mcpTools,
+      messages: messages
+    });
+    
+    console.log(`Stop reason: ${response.stop_reason}`);
+    
+    // Tool use loop
+    while (response.stop_reason === "tool_use") {
+      const toolUse = response.content.find(block => block.type === "tool_use");
+      
+      if (!toolUse) break;
+      
+      console.log(`Claude wants to use tool: ${toolUse.name}`);
+      
+      // Execute the tool
+      const toolResult = await executeMCPTool(toolUse.name, toolUse.input);
+      
+      // Add assistant's response and tool result to messages
+      messages.push({
+        role: "assistant",
+        content: response.content
+      });
+      
+      messages.push({
+        role: "user",
+        content: [
+          {
+            type: "tool_result",
+            tool_use_id: toolUse.id,
+            content: JSON.stringify(toolResult)
+          }
+        ]
+      });
+      
+      // Continue conversation
+      response = await anthropic.messages.create({
+        model: "claude-sonnet-4-5-20250929",
+        max_tokens: 4000,
+        tools: mcpTools,
+        messages: messages
+      });
+      
+      console.log(`Stop reason: ${response.stop_reason}`);
+    }
+    
+    // Extract final text response
+    const finalResponse = response.content.find(block => block.type === "text")?.text || 
+                          "No pude generar una respuesta.";
+    
+    res.json({
+      success: true,
+      response: finalResponse,
+      conversationHistory: [
+        ...conversationHistory,
+        {
+          role: "user",
+          content: message
+        },
+        {
+          role: "assistant",
+          content: finalResponse
+        }
+      ],
+      usage: {
+        inputTokens: response.usage.input_tokens,
+        outputTokens: response.usage.output_tokens,
+      }
+    });
+    
+  } catch (error) {
+    console.error('MCP Chat error:', error.message);
+    res.status(500).json({
+      success: false,
+      error: error.message,
+    });
+  }
+});
+
+// ============================================
 // SERVER
 // ============================================
 
