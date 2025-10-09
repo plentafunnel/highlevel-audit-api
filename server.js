@@ -79,7 +79,7 @@ app.get('/api/contacts', async (req, res) => {
     
     if (refresh === 'true' || count === 0) {
       const params = {
-        location_id: HIGHLEVEL_LOCATION_ID,
+        locationId: HIGHLEVEL_LOCATION_ID,
         limit: parseInt(limit),
       };
       
@@ -200,7 +200,7 @@ app.get('/api/contacts/:contactId/conversations', async (req, res) => {
           Version: '2021-07-28',
         },
         params: {
-          location_id: HIGHLEVEL_LOCATION_ID,
+          locationId: HIGHLEVEL_LOCATION_ID,
           contactId: req.params.contactId,
           limit: parseInt(limit),
         },
@@ -268,7 +268,7 @@ app.get('/api/pipelines', async (req, res) => {
           Version: '2021-07-28',
         },
         params: {
-          location_id: HIGHLEVEL_LOCATION_ID,
+          locationId: HIGHLEVEL_LOCATION_ID,
         },
       }
     );
@@ -309,7 +309,7 @@ app.get('/api/opportunities', async (req, res) => {
     });
     
     const params = {
-      location_id: HIGHLEVEL_LOCATION_ID,
+      locationId: HIGHLEVEL_LOCATION_ID,
       limit: parseInt(limit),
     };
     
@@ -889,7 +889,7 @@ app.post('/api/analyze-contact', async (req, res) => {
           Version: '2021-07-28',
         },
         params: {
-          location_id: HIGHLEVEL_LOCATION_ID,
+          locationId: HIGHLEVEL_LOCATION_ID,
           contactId: contactId,
           limit: 100,
         },
@@ -1315,7 +1315,7 @@ async function executeMCPTool(toolName, toolInput) {
       case "get_contacts": {
         const { limit = 20, query } = toolInput;
         const params = {
-          location_id: HIGHLEVEL_LOCATION_ID,
+          locationId: HIGHLEVEL_LOCATION_ID,
           limit: parseInt(limit),
         };
         if (query) params.query = query;
@@ -1379,7 +1379,7 @@ async function executeMCPTool(toolName, toolInput) {
               Version: '2021-07-28',
             },
             params: {
-              location_id: HIGHLEVEL_LOCATION_ID,
+              locationId: HIGHLEVEL_LOCATION_ID,
               contactId: contactId,
               limit: parseInt(limit),
             },
