@@ -10,7 +10,18 @@ dotenv.config();
 
 const app = express();
 app.use(express.json({ limit: '50mb' }));
-app.use(cors());
+
+// CORS configuration
+app.use(cors({
+  origin: [
+    'https://delveranda-auditor-dashboard.lovable.app',
+    'http://localhost:5173',
+    'http://localhost:3000',
+  ],
+  credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization']
+}));
 
 const anthropic = new Anthropic({
   apiKey: process.env.ANTHROPIC_API_KEY,
