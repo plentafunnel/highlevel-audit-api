@@ -974,6 +974,211 @@ app.post('/api/chat', async (req, res) => {
 });
 
 // ============================================
+// OPPORTUNITIES ENDPOINTS
+// ============================================
+
+// Get all pipelines
+app.get('/api/pipelines', async (req, res) => {
+  try {
+    const response = await axios.get(
+      `https://services.leadconnectorhq.com/opportunities/pipelines`,
+      {
+        headers: {
+          Authorization: `Bearer ${HIGHLEVEL_API_KEY}`,
+          Version: '2021-07-28',
+        },
+        params: {
+          locationId: HIGHLEVEL_LOCATION_ID,
+        },
+      }
+    );
+    
+    res.json({
+      success: true,
+      pipelines: response.data.pipelines || [],
+    });
+  } catch (error) {
+    console.error('Error getting pipelines:', error.message);
+    res.status(500).json({
+      success: false,
+      error: error.message,
+    });
+  }
+});
+
+// Get opportunities with filters and pagination
+app.get('/api/opportunities', async (req, res) => {
+  try {
+    const { 
+      pipelineId, 
+      status, // open, won, lost, abandoned
+      limit = 100,
+      startAfter,
+      query 
+    } = req.query;
+    
+    const params = {
+      locationId: HIGHLEVEL_LOCATION_ID,
+      limit: parseInt(limit),
+    };
+    
+    if (pipelineId) params.pipelineId = pipelineId;
+    if (status) params.status = status;
+    if (startAfter) params.startAfter = startAfter;
+    if (query) params.query = query;
+    
+    const response = await axios.get(
+      'https://services.leadconnectorhq.com/opportunities/search',
+      {
+        headers: {
+          Authorization: `Bearer ${HIGHLEVEL_API_KEY}`,
+          Version: '2021-07-28',
+        },
+        params,
+      }
+    );
+    
+    // Get contact details for each opportunity
+    const opportunitiesWithContacts = await Promise.all(
+      (response.data.opportunities || []).map(async (opp) => {
+        try {
+          const contactResponse = await axios.get(
+            `https://services.leadconnectorhq.com/contacts/${opp.contact.id}`,
+            {
+              headers: {
+                Authorization: `Bearer ${HIGHLEVEL_API_KEY}`,
+                Version: '2021-07-28',
+              },
+            }
+          );
+          
+          const contact = contactResponse.data.contact;
+          
+          // Check if has analysis
+          const { data: analysis } = await supabase
+            .from('analyses')
+            .select('id')
+            .eq('contact_id', opp.contact.id)
+            .limit(1)
+            .single();
+          
+          return {
+            id: opp.id,
+            name: opp.name,
+            pipelineId: opp.pipelineId,
+            pipelineStageId: opp.pipelineStageId,
+            status: opp.status,
+            monetaryValue: opp.monetaryValue,
+            assignedTo: opp.assignedTo,
+            contact: {
+              id: contact.id,
+              name: `${contact.firstName || ''} ${contact.lastName || ''}`.trim(),
+              email: contact.email,
+              phone: contact.phone,
+            },
+            hasAnalysis: !!analysis,
+            createdAt: opp.createdAt,
+            lastStatusChangeAt: opp.lastStatusChangeAt,
+          };
+        } catch (err) {
+          console.error(`Error getting contact for opp ${opp.id}:`, err.message);
+          return {
+            id: opp.id,
+            name: opp.name,
+            pipelineId: opp.pipelineId,
+            pipelineStageId: opp.pipelineStageId,
+            status: opp.status,
+            monetaryValue: opp.monetaryValue,
+            assignedTo: opp.assignedTo,
+            contact: {
+              id: opp.contact.id,
+              name: opp.contact.name || 'Unknown',
+              email: null,
+              phone: null,
+            },
+            hasAnalysis: false,
+            createdAt: opp.createdAt,
+            lastStatusChangeAt: opp.lastStatusChangeAt,
+          };
+        }
+      })
+    );
+    
+    res.json({
+      success: true,
+      opportunities: opportunitiesWithContacts,
+      total: response.data.total,
+      nextStartAfter: response.data.meta?.nextStartAfter || null,
+    });
+  } catch (error) {
+    console.error('Error getting opportunities:', error.message);
+    res.status(500).json({
+      success: false,
+      error: error.message,
+    });
+  }
+});
+
+// Get single opportunity
+app.get('/api/opportunities/:opportunityId', async (req, res) => {
+  try {
+    const response = await axios.get(
+      `https://services.leadconnectorhq.com/opportunities/${req.params.opportunityId}`,
+      {
+        headers: {
+          Authorization: `Bearer ${HIGHLEVEL_API_KEY}`,
+          Version: '2021-07-28',
+        },
+      }
+    );
+    
+    const opp = response.data.opportunity;
+    
+    // Get contact details
+    const contactResponse = await axios.get(
+      `https://services.leadconnectorhq.com/contacts/${opp.contact.id}`,
+      {
+        headers: {
+          Authorization: `Bearer ${HIGHLEVEL_API_KEY}`,
+          Version: '2021-07-28',
+        },
+      }
+    );
+    
+    const contact = contactResponse.data.contact;
+    
+    res.json({
+      success: true,
+      opportunity: {
+        id: opp.id,
+        name: opp.name,
+        pipelineId: opp.pipelineId,
+        pipelineStageId: opp.pipelineStageId,
+        status: opp.status,
+        monetaryValue: opp.monetaryValue,
+        assignedTo: opp.assignedTo,
+        contact: {
+          id: contact.id,
+          name: `${contact.firstName || ''} ${contact.lastName || ''}`.trim(),
+          email: contact.email,
+          phone: contact.phone,
+          tags: contact.tags,
+        },
+        createdAt: opp.createdAt,
+        lastStatusChangeAt: opp.lastStatusChangeAt,
+      }
+    });
+  } catch (error) {
+    console.error('Error getting opportunity:', error.message);
+    res.status(500).json({
+      success: false,
+      error: error.message,
+    });
+  }
+});
+
+
+// ============================================
 // MCP-ENABLED CHAT
 // ============================================
 
