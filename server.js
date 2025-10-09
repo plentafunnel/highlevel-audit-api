@@ -36,10 +36,11 @@ app.get('/health', (req, res) => {
   res.json({ 
     status: 'ok',
     message: 'HighLevel Audit API is running',
-    version: '2.2.0',
+    version: '2.3.0',
     database: 'Supabase PostgreSQL',
     features: [
       'contacts',
+      'opportunities',
       'conversations', 
       'transcriptions',
       'chat',
@@ -61,12 +62,10 @@ app.get('/api/contacts', async (req, res) => {
   try {
     const { limit = 100, query, refresh = false } = req.query;
     
-    // Check if cache exists
     const { count } = await supabase
       .from('contacts_cache')
       .select('*', { count: 'exact', head: true });
     
-    // If refresh or cache is empty, fetch from HighLevel
     if (refresh === 'true' || count === 0) {
       const params = {
         locationId: HIGHLEVEL_LOCATION_ID,
@@ -86,7 +85,6 @@ app.get('/api/contacts', async (req, res) => {
         }
       );
       
-      // Update cache in Supabase
       const contactsToCache = response.data.contacts.map(contact => ({
         contact_id: contact.id,
         full_name: `${contact.firstName || ''} ${contact.lastName || ''}`.trim(),
@@ -96,7 +94,6 @@ app.get('/api/contacts', async (req, res) => {
         last_synced: new Date().toISOString(),
       }));
       
-      // Upsert contacts
       if (contactsToCache.length > 0) {
         await supabase
           .from('contacts_cache')
@@ -104,7 +101,6 @@ app.get('/api/contacts', async (req, res) => {
       }
     }
     
-    // Fetch from cache
     let dbQuery = supabase
       .from('contacts_cache')
       .select('*')
@@ -141,7 +137,7 @@ app.get('/api/contacts', async (req, res) => {
   }
 });
 
-// Get single contact with full details
+// Get single contact
 app.get('/api/contacts/:contactId', async (req, res) => {
   try {
     const response = await axios.get(
@@ -180,7 +176,7 @@ app.get('/api/contacts/:contactId', async (req, res) => {
   }
 });
 
-// Get all conversations for a contact
+// Get conversations for a contact
 app.get('/api/contacts/:contactId/conversations', async (req, res) => {
   try {
     const { limit = 50 } = req.query;
@@ -239,6 +235,276 @@ app.get('/api/conversations/:conversationId/messages', async (req, res) => {
     });
   } catch (error) {
     console.error('Error getting messages:', error.message);
+    res.status(500).json({
+      success: false,
+      error: error.message,
+    });
+  }
+});
+
+// ============================================
+// OPPORTUNITIES ENDPOINTS
+// ============================================
+
+// Get all pipelines
+app.get('/api/pipelines', async (req, res) => {
+  try {
+    const response = await axios.get(
+      `https://services.leadconnectorhq.com/opportunities/pipelines`,
+      {
+        headers: {
+          Authorization: `Bearer ${HIGHLEVEL_API_KEY}`,
+          Version: '2021-07-28',
+        },
+        params: {
+          locationId: HIGHLEVEL_LOCATION_ID,
+        },
+      }
+    );
+    
+    res.json({
+      success: true,
+      pipelines: response.data.pipelines || [],
+    });
+  } catch (error) {
+    console.error('Error getting pipelines:', error.message);
+    res.status(500).json({
+      success: false,
+      error: error.message,
+      details: error.response?.data || null,
+    });
+  }
+});
+
+// Get opportunities with filters and pagination
+app.get('/api/opportunities', async (req, res) => {
+  try {
+    const { 
+      pipelineId, 
+      status,
+      limit = 100,
+      startAfter,
+      startAfterId,
+      query 
+    } = req.query;
+    
+    console.log('Getting opportunities with params:', {
+      pipelineId,
+      status,
+      limit,
+      startAfter,
+      startAfterId,
+      query
+    });
+    
+    const params = {
+      locationId: HIGHLEVEL_LOCATION_ID,
+      limit: parseInt(limit),
+    };
+    
+    if (pipelineId && pipelineId !== 'all' && pipelineId !== '') {
+      params.pipelineId = pipelineId;
+    }
+    
+    if (status && status !== 'all' && status !== '') {
+      params.status = status;
+    }
+    
+    if (startAfterId) {
+      params.startAfterId = startAfterId;
+    } else if (startAfter) {
+      params.startAfterId = startAfter;
+    }
+    
+    if (query && query.trim() !== '') {
+      params.q = query.trim();
+    }
+    
+    console.log('Final params for HighLevel API:', params);
+    
+    const response = await axios.get(
+      'https://services.leadconnectorhq.com/opportunities/search',
+      {
+        headers: {
+          Authorization: `Bearer ${HIGHLEVEL_API_KEY}`,
+          Version: '2021-07-28',
+        },
+        params,
+      }
+    );
+    
+    console.log(`Got ${response.data.opportunities?.length || 0} opportunities`);
+    
+    const opportunities = response.data.opportunities || [];
+    const batchSize = 5;
+    const opportunitiesWithContacts = [];
+    
+    for (let i = 0; i < opportunities.length; i += batchSize) {
+      const batch = opportunities.slice(i, i + batchSize);
+      
+      const batchResults = await Promise.all(
+        batch.map(async (opp) => {
+          try {
+            if (opp.contact && opp.contact.email && opp.contact.phone) {
+              const { data: analysis } = await supabase
+                .from('analyses')
+                .select('id')
+                .eq('contact_id', opp.contact.id)
+                .limit(1)
+                .single();
+              
+              return {
+                id: opp.id,
+                name: opp.name,
+                pipelineId: opp.pipelineId,
+                pipelineStageId: opp.pipelineStageId,
+                status: opp.status,
+                monetaryValue: opp.monetaryValue,
+                assignedTo: opp.assignedTo,
+                contact: {
+                  id: opp.contact.id,
+                  name: opp.contact.name || 'Unknown',
+                  email: opp.contact.email,
+                  phone: opp.contact.phone,
+                },
+                hasAnalysis: !!analysis,
+                createdAt: opp.createdAt,
+                lastStatusChangeAt: opp.lastStatusChangeAt,
+              };
+            }
+            
+            const contactResponse = await axios.get(
+              `https://services.leadconnectorhq.com/contacts/${opp.contact.id}`,
+              {
+                headers: {
+                  Authorization: `Bearer ${HIGHLEVEL_API_KEY}`,
+                  Version: '2021-07-28',
+                },
+              }
+            );
+            
+            const contact = contactResponse.data.contact;
+            
+            const { data: analysis } = await supabase
+              .from('analyses')
+              .select('id')
+              .eq('contact_id', opp.contact.id)
+              .limit(1)
+              .single();
+            
+            return {
+              id: opp.id,
+              name: opp.name,
+              pipelineId: opp.pipelineId,
+              pipelineStageId: opp.pipelineStageId,
+              status: opp.status,
+              monetaryValue: opp.monetaryValue,
+              assignedTo: opp.assignedTo,
+              contact: {
+                id: contact.id,
+                name: `${contact.firstName || ''} ${contact.lastName || ''}`.trim(),
+                email: contact.email,
+                phone: contact.phone,
+              },
+              hasAnalysis: !!analysis,
+              createdAt: opp.createdAt,
+              lastStatusChangeAt: opp.lastStatusChangeAt,
+            };
+          } catch (err) {
+            console.error(`Error processing opportunity ${opp.id}:`, err.message);
+            return {
+              id: opp.id,
+              name: opp.name,
+              pipelineId: opp.pipelineId,
+              pipelineStageId: opp.pipelineStageId,
+              status: opp.status,
+              monetaryValue: opp.monetaryValue,
+              assignedTo: opp.assignedTo,
+              contact: {
+                id: opp.contact?.id || 'unknown',
+                name: opp.contact?.name || 'Unknown',
+                email: null,
+                phone: null,
+              },
+              hasAnalysis: false,
+              createdAt: opp.createdAt,
+              lastStatusChangeAt: opp.lastStatusChangeAt,
+            };
+          }
+        })
+      );
+      
+      opportunitiesWithContacts.push(...batchResults);
+    }
+    
+    res.json({
+      success: true,
+      opportunities: opportunitiesWithContacts,
+      total: response.data.meta?.total || opportunitiesWithContacts.length,
+      nextStartAfterId: response.data.meta?.nextStartAfterId || null,
+      nextStartAfter: response.data.meta?.nextStartAfterId || null,
+    });
+  } catch (error) {
+    console.error('Error getting opportunities:', error.message);
+    console.error('Error details:', error.response?.data || error);
+    res.status(500).json({
+      success: false,
+      error: error.message,
+      details: error.response?.data || null,
+    });
+  }
+});
+
+// Get single opportunity
+app.get('/api/opportunities/:opportunityId', async (req, res) => {
+  try {
+    const response = await axios.get(
+      `https://services.leadconnectorhq.com/opportunities/${req.params.opportunityId}`,
+      {
+        headers: {
+          Authorization: `Bearer ${HIGHLEVEL_API_KEY}`,
+          Version: '2021-07-28',
+        },
+      }
+    );
+    
+    const opp = response.data.opportunity;
+    
+    const contactResponse = await axios.get(
+      `https://services.leadconnectorhq.com/contacts/${opp.contact.id}`,
+      {
+        headers: {
+          Authorization: `Bearer ${HIGHLEVEL_API_KEY}`,
+          Version: '2021-07-28',
+        },
+      }
+    );
+    
+    const contact = contactResponse.data.contact;
+    
+    res.json({
+      success: true,
+      opportunity: {
+        id: opp.id,
+        name: opp.name,
+        pipelineId: opp.pipelineId,
+        pipelineStageId: opp.pipelineStageId,
+        status: opp.status,
+        monetaryValue: opp.monetaryValue,
+        assignedTo: opp.assignedTo,
+        contact: {
+          id: contact.id,
+          name: `${contact.firstName || ''} ${contact.lastName || ''}`.trim(),
+          email: contact.email,
+          phone: contact.phone,
+          tags: contact.tags,
+        },
+        createdAt: opp.createdAt,
+        lastStatusChangeAt: opp.lastStatusChangeAt,
+      }
+    });
+  } catch (error) {
+    console.error('Error getting opportunity:', error.message);
     res.status(500).json({
       success: false,
       error: error.message,
@@ -308,10 +574,9 @@ app.post('/api/transcribe', async (req, res) => {
 });
 
 // ============================================
-// PROMPTS MANAGEMENT (Supabase)
+// PROMPTS MANAGEMENT
 // ============================================
 
-// Get all prompts with history
 app.get('/api/prompts/history', async (req, res) => {
   try {
     const { data: prompts, error } = await supabase
@@ -353,7 +618,6 @@ app.get('/api/prompts/history', async (req, res) => {
   }
 });
 
-// Get active prompt
 app.get('/api/prompts/active', async (req, res) => {
   try {
     const { data, error } = await supabase
@@ -386,7 +650,6 @@ app.get('/api/prompts/active', async (req, res) => {
   }
 });
 
-// Save new prompt version
 app.post('/api/prompts', async (req, res) => {
   try {
     const { content, settings, createdBy } = req.body;
@@ -398,7 +661,6 @@ app.post('/api/prompts', async (req, res) => {
       });
     }
     
-    // Get max version
     const { data: maxData } = await supabase
       .from('prompts')
       .select('version')
@@ -408,13 +670,11 @@ app.post('/api/prompts', async (req, res) => {
     
     const nextVersion = (maxData?.version || 0) + 1;
     
-    // Deactivate all prompts
     await supabase
       .from('prompts')
       .update({ is_active: false })
       .eq('is_active', true);
     
-    // Insert new prompt
     const { data: newPrompt, error } = await supabase
       .from('prompts')
       .insert({
@@ -458,16 +718,13 @@ app.post('/api/prompts', async (req, res) => {
   }
 });
 
-// Restore a specific prompt version
 app.post('/api/prompts/:id/restore', async (req, res) => {
   try {
-    // Deactivate all
     await supabase
       .from('prompts')
       .update({ is_active: false })
       .eq('is_active', true);
     
-    // Activate selected
     const { data: restored, error } = await supabase
       .from('prompts')
       .update({ is_active: true })
@@ -506,7 +763,6 @@ app.post('/api/prompts/:id/restore', async (req, res) => {
   }
 });
 
-// Delete a prompt version
 app.delete('/api/prompts/:id', async (req, res) => {
   try {
     const { data: deleted, error } = await supabase
@@ -525,7 +781,6 @@ app.delete('/api/prompts/:id', async (req, res) => {
       });
     }
     
-    // If deleted was active, activate the latest
     if (deleted.is_active) {
       const { data: latest } = await supabase
         .from('prompts')
@@ -556,7 +811,7 @@ app.delete('/api/prompts/:id', async (req, res) => {
 });
 
 // ============================================
-// FULL CONTACT ANALYSIS (Supabase)
+// FULL CONTACT ANALYSIS
 // ============================================
 
 app.post('/api/analyze-contact', async (req, res) => {
@@ -578,7 +833,6 @@ app.post('/api/analyze-contact', async (req, res) => {
     
     console.log(`Starting full analysis for contact: ${contactId}`);
     
-    // Get prompt (use provided or active)
     let prompt;
     if (promptId) {
       const { data } = await supabase
@@ -603,7 +857,6 @@ app.post('/api/analyze-contact', async (req, res) => {
       });
     }
     
-    // 1. Get contact info
     console.log('Step 1/4: Fetching contact info...');
     const contactResponse = await axios.get(
       `https://services.leadconnectorhq.com/contacts/${contactId}`,
@@ -616,7 +869,6 @@ app.post('/api/analyze-contact', async (req, res) => {
     );
     const contact = contactResponse.data.contact;
     
-    // 2. Get all conversations
     console.log('Step 2/4: Fetching conversations...');
     const conversationsResponse = await axios.get(
       'https://services.leadconnectorhq.com/conversations/search',
@@ -635,7 +887,6 @@ app.post('/api/analyze-contact', async (req, res) => {
     
     const conversations = conversationsResponse.data.conversations || [];
     
-    // 3. Extract all messages and transcribe calls
     console.log('Step 3/4: Processing messages and transcribing calls...');
     let allMessages = [];
     let transcriptions = [];
@@ -655,9 +906,7 @@ app.post('/api/analyze-contact', async (req, res) => {
       const messages = messagesResponse.data.messages || [];
       
       for (const msg of messages) {
-        // Filter by type
         if (msg.type === 'TYPE_CALL' && includeCalls) {
-          // Transcribe call
           try {
             const recordingUrl = `https://services.leadconnectorhq.com/conversations/messages/${msg.id}/locations/${HIGHLEVEL_LOCATION_ID}/recording`;
             
@@ -714,12 +963,10 @@ app.post('/api/analyze-contact', async (req, res) => {
       }
     }
     
-    // 4. Build context
     console.log('Step 4/4: Running AI analysis...');
     
     let contextParts = [];
     
-    // Contact info
     if (prompt.settings.includeContactInfo) {
       contextParts.push(`**INFORMACIÓN DEL CONTACTO:**
 - Nombre: ${contact.firstName} ${contact.lastName}
@@ -729,7 +976,6 @@ app.post('/api/analyze-contact', async (req, res) => {
 - Fuente: ${contact.source || 'No especificada'}`);
     }
     
-    // Messages timeline
     if (allMessages.length > 0) {
       const sortedMessages = allMessages.sort((a, b) => 
         new Date(a.date) - new Date(b.date)
@@ -745,7 +991,6 @@ app.post('/api/analyze-contact', async (req, res) => {
     
     const fullContext = contextParts.join('\n\n━━━━━━━━━━━━━━━━━━━━━━━━\n\n');
     
-    // 5. Send to Claude
     const claudeResponse = await anthropic.messages.create({
       model: prompt.settings.model || 'claude-sonnet-4-5-20250929',
       max_tokens: 4000,
@@ -757,7 +1002,6 @@ app.post('/api/analyze-contact', async (req, res) => {
     
     const analysisText = claudeResponse.content[0].text;
     
-    // 6. Save analysis to Supabase
     const { data: savedAnalysis, error: saveError } = await supabase
       .from('analyses')
       .insert({
@@ -805,7 +1049,6 @@ app.post('/api/analyze-contact', async (req, res) => {
   }
 });
 
-// Get latest analysis for a contact
 app.get('/api/analyses/:contactId/latest', async (req, res) => {
   try {
     const { data, error } = await supabase
@@ -842,7 +1085,6 @@ app.get('/api/analyses/:contactId/latest', async (req, res) => {
   }
 });
 
-// Get all analyses for a contact
 app.get('/api/analyses/:contactId', async (req, res) => {
   try {
     const { data: analyses, error } = await supabase
@@ -877,25 +1119,18 @@ app.get('/api/analyses/:contactId', async (req, res) => {
   }
 });
 
-// Re-analyze contact
 app.post('/api/analyses/:contactId/reanalyze', async (req, res) => {
   try {
     const { promptId } = req.body;
     
-    // Call analyze-contact endpoint
-    const analysisReq = {
-      body: {
+    return app._router.handle(
+      { ...req, url: '/api/analyze-contact', method: 'POST', body: {
         contactId: req.params.contactId,
         promptId,
         includeWhatsApp: true,
         includeSMS: true,
         includeCalls: true,
-      }
-    };
-    
-    // Redirect to analyze-contact
-    return app._router.handle(
-      { ...req, url: '/api/analyze-contact', method: 'POST', body: analysisReq.body },
+      }},
       res
     );
     
@@ -974,215 +1209,9 @@ app.post('/api/chat', async (req, res) => {
 });
 
 // ============================================
-// OPPORTUNITIES ENDPOINTS
-// ============================================
-
-// Get all pipelines
-app.get('/api/pipelines', async (req, res) => {
-  try {
-    const response = await axios.get(
-      `https://services.leadconnectorhq.com/opportunities/pipelines`,
-      {
-        headers: {
-          Authorization: `Bearer ${HIGHLEVEL_API_KEY}`,
-          Version: '2021-07-28',
-        },
-        params: {
-          locationId: HIGHLEVEL_LOCATION_ID,
-        },
-      }
-    );
-    
-    res.json({
-      success: true,
-      pipelines: response.data.pipelines || [],
-    });
-  } catch (error) {
-    console.error('Error getting pipelines:', error.message);
-    res.status(500).json({
-      success: false,
-      error: error.message,
-    });
-  }
-});
-
-// Get opportunities with filters and pagination
-app.get('/api/opportunities', async (req, res) => {
-  try {
-    const { 
-      pipelineId, 
-      status, // open, won, lost, abandoned
-      limit = 100,
-      startAfter,
-      query 
-    } = req.query;
-    
-    const params = {
-      locationId: HIGHLEVEL_LOCATION_ID,
-      limit: parseInt(limit),
-    };
-    
-    if (pipelineId) params.pipelineId = pipelineId;
-    if (status) params.status = status;
-    if (startAfter) params.startAfter = startAfter;
-    if (query) params.query = query;
-    
-    const response = await axios.get(
-      'https://services.leadconnectorhq.com/opportunities/search',
-      {
-        headers: {
-          Authorization: `Bearer ${HIGHLEVEL_API_KEY}`,
-          Version: '2021-07-28',
-        },
-        params,
-      }
-    );
-    
-    // Get contact details for each opportunity
-    const opportunitiesWithContacts = await Promise.all(
-      (response.data.opportunities || []).map(async (opp) => {
-        try {
-          const contactResponse = await axios.get(
-            `https://services.leadconnectorhq.com/contacts/${opp.contact.id}`,
-            {
-              headers: {
-                Authorization: `Bearer ${HIGHLEVEL_API_KEY}`,
-                Version: '2021-07-28',
-              },
-            }
-          );
-          
-          const contact = contactResponse.data.contact;
-          
-          // Check if has analysis
-          const { data: analysis } = await supabase
-            .from('analyses')
-            .select('id')
-            .eq('contact_id', opp.contact.id)
-            .limit(1)
-            .single();
-          
-          return {
-            id: opp.id,
-            name: opp.name,
-            pipelineId: opp.pipelineId,
-            pipelineStageId: opp.pipelineStageId,
-            status: opp.status,
-            monetaryValue: opp.monetaryValue,
-            assignedTo: opp.assignedTo,
-            contact: {
-              id: contact.id,
-              name: `${contact.firstName || ''} ${contact.lastName || ''}`.trim(),
-              email: contact.email,
-              phone: contact.phone,
-            },
-            hasAnalysis: !!analysis,
-            createdAt: opp.createdAt,
-            lastStatusChangeAt: opp.lastStatusChangeAt,
-          };
-        } catch (err) {
-          console.error(`Error getting contact for opp ${opp.id}:`, err.message);
-          return {
-            id: opp.id,
-            name: opp.name,
-            pipelineId: opp.pipelineId,
-            pipelineStageId: opp.pipelineStageId,
-            status: opp.status,
-            monetaryValue: opp.monetaryValue,
-            assignedTo: opp.assignedTo,
-            contact: {
-              id: opp.contact.id,
-              name: opp.contact.name || 'Unknown',
-              email: null,
-              phone: null,
-            },
-            hasAnalysis: false,
-            createdAt: opp.createdAt,
-            lastStatusChangeAt: opp.lastStatusChangeAt,
-          };
-        }
-      })
-    );
-    
-    res.json({
-      success: true,
-      opportunities: opportunitiesWithContacts,
-      total: response.data.total,
-      nextStartAfter: response.data.meta?.nextStartAfter || null,
-    });
-  } catch (error) {
-    console.error('Error getting opportunities:', error.message);
-    res.status(500).json({
-      success: false,
-      error: error.message,
-    });
-  }
-});
-
-// Get single opportunity
-app.get('/api/opportunities/:opportunityId', async (req, res) => {
-  try {
-    const response = await axios.get(
-      `https://services.leadconnectorhq.com/opportunities/${req.params.opportunityId}`,
-      {
-        headers: {
-          Authorization: `Bearer ${HIGHLEVEL_API_KEY}`,
-          Version: '2021-07-28',
-        },
-      }
-    );
-    
-    const opp = response.data.opportunity;
-    
-    // Get contact details
-    const contactResponse = await axios.get(
-      `https://services.leadconnectorhq.com/contacts/${opp.contact.id}`,
-      {
-        headers: {
-          Authorization: `Bearer ${HIGHLEVEL_API_KEY}`,
-          Version: '2021-07-28',
-        },
-      }
-    );
-    
-    const contact = contactResponse.data.contact;
-    
-    res.json({
-      success: true,
-      opportunity: {
-        id: opp.id,
-        name: opp.name,
-        pipelineId: opp.pipelineId,
-        pipelineStageId: opp.pipelineStageId,
-        status: opp.status,
-        monetaryValue: opp.monetaryValue,
-        assignedTo: opp.assignedTo,
-        contact: {
-          id: contact.id,
-          name: `${contact.firstName || ''} ${contact.lastName || ''}`.trim(),
-          email: contact.email,
-          phone: contact.phone,
-          tags: contact.tags,
-        },
-        createdAt: opp.createdAt,
-        lastStatusChangeAt: opp.lastStatusChangeAt,
-      }
-    });
-  } catch (error) {
-    console.error('Error getting opportunity:', error.message);
-    res.status(500).json({
-      success: false,
-      error: error.message,
-    });
-  }
-});
-
-
-// ============================================
 // MCP-ENABLED CHAT
 // ============================================
 
-// Define MCP tools for Claude
 const mcpTools = [
   {
     name: "get_contacts",
@@ -1267,7 +1296,6 @@ const mcpTools = [
   }
 ];
 
-// Execute MCP tool
 async function executeMCPTool(toolName, toolInput) {
   console.log(`Executing MCP tool: ${toolName}`, toolInput);
   
@@ -1414,7 +1442,6 @@ async function executeMCPTool(toolName, toolInput) {
   }
 }
 
-// Chat endpoint with MCP tools
 app.post('/api/chat-mcp', async (req, res) => {
   try {
     const { message, conversationHistory = [] } = req.body;
@@ -1428,7 +1455,6 @@ app.post('/api/chat-mcp', async (req, res) => {
     
     console.log(`MCP Chat request: "${message}"`);
     
-    // Build messages array
     const messages = [
       ...conversationHistory,
       {
@@ -1437,7 +1463,6 @@ app.post('/api/chat-mcp', async (req, res) => {
       }
     ];
     
-    // Initial request to Claude with tools
     let response = await anthropic.messages.create({
       model: "claude-sonnet-4-5-20250929",
       max_tokens: 4000,
@@ -1447,7 +1472,6 @@ app.post('/api/chat-mcp', async (req, res) => {
     
     console.log(`Stop reason: ${response.stop_reason}`);
     
-    // Tool use loop
     while (response.stop_reason === "tool_use") {
       const toolUse = response.content.find(block => block.type === "tool_use");
       
@@ -1455,10 +1479,8 @@ app.post('/api/chat-mcp', async (req, res) => {
       
       console.log(`Claude wants to use tool: ${toolUse.name}`);
       
-      // Execute the tool
       const toolResult = await executeMCPTool(toolUse.name, toolUse.input);
       
-      // Add assistant's response and tool result to messages
       messages.push({
         role: "assistant",
         content: response.content
@@ -1475,7 +1497,6 @@ app.post('/api/chat-mcp', async (req, res) => {
         ]
       });
       
-      // Continue conversation
       response = await anthropic.messages.create({
         model: "claude-sonnet-4-5-20250929",
         max_tokens: 4000,
@@ -1486,7 +1507,6 @@ app.post('/api/chat-mcp', async (req, res) => {
       console.log(`Stop reason: ${response.stop_reason}`);
     }
     
-    // Extract final text response
     const finalResponse = response.content.find(block => block.type === "text")?.text || 
                           "No pude generar una respuesta.";
     
@@ -1525,13 +1545,14 @@ app.post('/api/chat-mcp', async (req, res) => {
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, '0.0.0.0', () => {
-  console.log(`🚀 HighLevel Audit API v2.2 running on port ${PORT}`);
+  console.log(`🚀 HighLevel Audit API v2.3 running on port ${PORT}`);
   console.log(`📍 Health: http://localhost:${PORT}/health`);
   console.log(`💾 Database: Supabase PostgreSQL`);
   console.log(`🎯 Features:`);
   console.log(`   - Persistent storage with Supabase`);
   console.log(`   - Prompts management with versioning`);
   console.log(`   - Full contact analysis`);
+  console.log(`   - Opportunities with filters`);
   console.log(`   - MCP-enabled intelligent chat`);
   console.log(`   - Contacts caching`);
   console.log(`   - Analysis history`);
