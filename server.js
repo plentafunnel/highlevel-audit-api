@@ -10,8 +10,6 @@ dotenv.config();
 
 const app = express();
 app.use(express.json({ limit: '50mb' }));
-
-// CORS configuration
 app.use(cors({
   origin: [
     'https://delveranda-auditor-dashboard.lovable.app',
@@ -47,7 +45,7 @@ app.get('/health', (req, res) => {
   res.json({ 
     status: 'ok',
     message: 'HighLevel Audit API is running',
-    version: '2.3.0',
+    version: '2.4.0',
     database: 'Supabase PostgreSQL',
     features: [
       'contacts',
@@ -287,8 +285,7 @@ app.get('/api/pipelines', async (req, res) => {
   }
 });
 
-// Get opportunities with filters and pagination
-// Get opportunities - SIMPLIFIED WORKING VERSION
+// Get opportunities - TRY BOTH FORMATS
 app.get('/api/opportunities', async (req, res) => {
   try {
     const { 
@@ -299,7 +296,7 @@ app.get('/api/opportunities', async (req, res) => {
     
     console.log('Getting opportunities with filters:', { pipelineId, status, limit });
     
-    // Step 1: Get all pipelines first
+    // Step 1: Get all pipelines first (this works with locationId)
     const pipelinesResponse = await axios.get(
       `https://services.leadconnectorhq.com/opportunities/pipelines`,
       {
@@ -325,82 +322,133 @@ app.get('/api/opportunities', async (req, res) => {
       });
     }
     
-    // Step 2: Get opportunities from each pipeline
+    // Step 2: Try to get opportunities using search endpoint with BOTH parameter formats
     let allOpportunities = [];
     
-    // Determine which pipelines to query
-    const pipelinesToQuery = pipelineId && pipelineId !== 'all' 
-      ? pipelines.filter(p => p.id === pipelineId)
-      : pipelines;
-    
-    console.log(`Querying ${pipelinesToQuery.length} pipelines`);
-    
-    for (const pipeline of pipelinesToQuery) {
-      try {
-        console.log(`Fetching opportunities for pipeline: ${pipeline.name} (${pipeline.id})`);
-        
-        // Use the pipeline-specific endpoint
-        const oppUrl = `https://services.leadconnectorhq.com/opportunities/pipelines/${pipeline.id}`;
-        
-        const oppResponse = await axios.get(oppUrl, {
+    try {
+      console.log('Attempting to fetch opportunities with location_id (snake_case)...');
+      
+      const searchParams = {
+        location_id: HIGHLEVEL_LOCATION_ID,
+        limit: parseInt(limit),
+      };
+      
+      if (pipelineId && pipelineId !== 'all') {
+        searchParams.pipelineId = pipelineId;
+      }
+      
+      if (status && status !== 'all') {
+        searchParams.status = status;
+      }
+      
+      console.log('Search params:', searchParams);
+      
+      const searchResponse = await axios.get(
+        'https://services.leadconnectorhq.com/opportunities/search',
+        {
           headers: {
             Authorization: `Bearer ${HIGHLEVEL_API_KEY}`,
             Version: '2021-07-28',
           },
-        });
+          params: searchParams,
+        }
+      );
+      
+      allOpportunities = searchResponse.data.opportunities || [];
+      console.log(`Got ${allOpportunities.length} opportunities from search endpoint with location_id`);
+      
+    } catch (searchError) {
+      console.error('Search with location_id failed:', searchError.message);
+      console.log('Trying with locationId (camelCase)...');
+      
+      try {
+        const searchParams = {
+          locationId: HIGHLEVEL_LOCATION_ID,
+          limit: parseInt(limit),
+        };
         
-        // The response should have pipeline data with opportunities
-        const pipelineData = oppResponse.data.pipeline || oppResponse.data;
-        console.log(`Pipeline response structure:`, Object.keys(pipelineData));
-        
-        // Try to extract opportunities from different possible structures
-        let opportunities = [];
-        
-        if (pipelineData.opportunities) {
-          opportunities = pipelineData.opportunities;
-        } else if (pipelineData.stages) {
-          // Extract opportunities from stages
-          pipelineData.stages.forEach(stage => {
-            if (stage.opportunities) {
-              opportunities.push(...stage.opportunities);
-            }
-          });
-        } else if (Array.isArray(pipelineData)) {
-          opportunities = pipelineData;
+        if (pipelineId && pipelineId !== 'all') {
+          searchParams.pipelineId = pipelineId;
         }
         
-        console.log(`Found ${opportunities.length} opportunities in ${pipeline.name}`);
+        if (status && status !== 'all') {
+          searchParams.status = status;
+        }
         
-        // Add pipeline info to each opportunity
-        opportunities = opportunities.map(opp => ({
-          ...opp,
-          pipelineName: pipeline.name,
-          pipelineId: pipeline.id,
-        }));
+        console.log('Search params (camelCase):', searchParams);
         
-        allOpportunities.push(...opportunities);
+        const searchResponse = await axios.get(
+          'https://services.leadconnectorhq.com/opportunities/search',
+          {
+            headers: {
+              Authorization: `Bearer ${HIGHLEVEL_API_KEY}`,
+              Version: '2021-07-28',
+            },
+            params: searchParams,
+          }
+        );
         
-      } catch (pipelineError) {
-        console.error(`Error getting opportunities for pipeline ${pipeline.name}:`, pipelineError.message);
-        console.error('Error details:', pipelineError.response?.data);
-        // Continue with next pipeline
+        allOpportunities = searchResponse.data.opportunities || [];
+        console.log(`Got ${allOpportunities.length} opportunities with camelCase locationId`);
+        
+      } catch (camelCaseError) {
+        console.error('Both formats failed. Trying pipeline-by-pipeline approach...');
+        
+        // Fallback: Get opportunities from each pipeline individually
+        for (const pipeline of pipelines) {
+          try {
+            const oppUrl = `https://services.leadconnectorhq.com/opportunities/pipelines/${pipeline.id}`;
+            
+            const oppResponse = await axios.get(oppUrl, {
+              headers: {
+                Authorization: `Bearer ${HIGHLEVEL_API_KEY}`,
+                Version: '2021-07-28',
+              },
+            });
+            
+            console.log(`Response structure for ${pipeline.name}:`, Object.keys(oppResponse.data));
+            
+            const pipelineData = oppResponse.data.pipeline || oppResponse.data;
+            let opportunities = [];
+            
+            if (pipelineData.opportunities) {
+              opportunities = pipelineData.opportunities;
+            } else if (pipelineData.stages) {
+              pipelineData.stages.forEach(stage => {
+                if (stage.opportunities) {
+                  opportunities.push(...stage.opportunities);
+                }
+              });
+            }
+            
+            opportunities = opportunities.map(opp => ({
+              ...opp,
+              pipelineName: pipeline.name,
+              pipelineId: pipeline.id,
+            }));
+            
+            allOpportunities.push(...opportunities);
+            
+          } catch (pipelineError) {
+            console.error(`Error getting opportunities for ${pipeline.name}:`, pipelineError.message);
+          }
+        }
       }
     }
     
-    console.log(`Total opportunities before filtering: ${allOpportunities.length}`);
+    console.log(`Total opportunities found: ${allOpportunities.length}`);
     
-    // Step 3: Filter by status if requested
+    // Filter by status if needed and not already filtered
     if (status && status !== 'all') {
       allOpportunities = allOpportunities.filter(opp => 
         opp.status?.toLowerCase() === status.toLowerCase()
       );
-      console.log(`After status filter (${status}): ${allOpportunities.length}`);
     }
     
-    // Step 4: Limit results
+    // Limit results
     const limitedOpps = allOpportunities.slice(0, parseInt(limit));
     
-    // Step 5: Enrich with contact details (in batches to avoid rate limits)
+    // Enrich with contact details
     const enrichedOpportunities = [];
     const batchSize = 3;
     
@@ -410,12 +458,16 @@ app.get('/api/opportunities', async (req, res) => {
       const batchResults = await Promise.all(
         batch.map(async (opp) => {
           try {
-            // Get contact details if not already present
             let contactData = opp.contact || {};
             
             if (!contactData.email || !contactData.phone) {
+              const contactId = opp.contactId || opp.contact?.id;
+              if (!contactId) {
+                throw new Error('No contact ID found');
+              }
+              
               const contactResponse = await axios.get(
-                `https://services.leadconnectorhq.com/contacts/${opp.contactId || opp.contact?.id}`,
+                `https://services.leadconnectorhq.com/contacts/${contactId}`,
                 {
                   headers: {
                     Authorization: `Bearer ${HIGHLEVEL_API_KEY}`,
@@ -440,7 +492,6 @@ app.get('/api/opportunities', async (req, res) => {
               };
             }
             
-            // Check if has analysis
             const { data: analysis } = await supabase
               .from('analyses')
               .select('id')
@@ -452,7 +503,7 @@ app.get('/api/opportunities', async (req, res) => {
               id: opp.id,
               name: opp.name || opp.title || 'Untitled',
               pipelineId: opp.pipelineId,
-              pipelineName: opp.pipelineName,
+              pipelineName: opp.pipelineName || pipelines.find(p => p.id === opp.pipelineId)?.name,
               pipelineStageId: opp.pipelineStageId || opp.stageId,
               status: opp.status,
               monetaryValue: opp.monetaryValue || opp.value,
@@ -468,7 +519,6 @@ app.get('/api/opportunities', async (req, res) => {
               id: opp.id,
               name: opp.name || 'Unknown',
               pipelineId: opp.pipelineId,
-              pipelineName: opp.pipelineName,
               status: opp.status,
               contact: {
                 id: opp.contactId || opp.contact?.id || 'unknown',
@@ -1593,14 +1643,14 @@ app.post('/api/chat-mcp', async (req, res) => {
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, '0.0.0.0', () => {
-  console.log(`🚀 HighLevel Audit API v2.3 running on port ${PORT}`);
+  console.log(`🚀 HighLevel Audit API v2.4 running on port ${PORT}`);
   console.log(`📍 Health: http://localhost:${PORT}/health`);
   console.log(`💾 Database: Supabase PostgreSQL`);
   console.log(`🎯 Features:`);
   console.log(`   - Persistent storage with Supabase`);
   console.log(`   - Prompts management with versioning`);
   console.log(`   - Full contact analysis`);
-  console.log(`   - Opportunities with filters`);
+  console.log(`   - Opportunities with flexible parameter handling`);
   console.log(`   - MCP-enabled intelligent chat`);
   console.log(`   - Contacts caching`);
   console.log(`   - Analysis history`);
