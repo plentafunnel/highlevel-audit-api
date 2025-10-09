@@ -288,176 +288,213 @@ app.get('/api/pipelines', async (req, res) => {
 });
 
 // Get opportunities with filters and pagination
+// Get opportunities - SIMPLIFIED WORKING VERSION
 app.get('/api/opportunities', async (req, res) => {
   try {
     const { 
       pipelineId, 
       status,
       limit = 100,
-      startAfter,
-      startAfterId,
-      query 
     } = req.query;
     
-    console.log('Getting opportunities with params:', {
-      pipelineId,
-      status,
-      limit,
-      startAfter,
-      startAfterId,
-      query
-    });
+    console.log('Getting opportunities with filters:', { pipelineId, status, limit });
     
-    const params = {
-      locationId: HIGHLEVEL_LOCATION_ID,
-      limit: parseInt(limit),
-    };
-    
-    if (pipelineId && pipelineId !== 'all' && pipelineId !== '') {
-      params.pipelineId = pipelineId;
-    }
-    
-    if (status && status !== 'all' && status !== '') {
-      params.status = status;
-    }
-    
-    if (startAfterId) {
-      params.startAfterId = startAfterId;
-    } else if (startAfter) {
-      params.startAfterId = startAfter;
-    }
-    
-    if (query && query.trim() !== '') {
-      params.q = query.trim();
-    }
-    
-    console.log('Final params for HighLevel API:', params);
-    
-    const response = await axios.get(
-      'https://services.leadconnectorhq.com/opportunities/search',
+    // Step 1: Get all pipelines first
+    const pipelinesResponse = await axios.get(
+      `https://services.leadconnectorhq.com/opportunities/pipelines`,
       {
         headers: {
           Authorization: `Bearer ${HIGHLEVEL_API_KEY}`,
           Version: '2021-07-28',
         },
-        params,
+        params: {
+          locationId: HIGHLEVEL_LOCATION_ID,
+        },
       }
     );
     
-    console.log(`Got ${response.data.opportunities?.length || 0} opportunities`);
+    const pipelines = pipelinesResponse.data.pipelines || [];
+    console.log(`Found ${pipelines.length} pipelines`);
     
-    const opportunities = response.data.opportunities || [];
-    const batchSize = 5;
-    const opportunitiesWithContacts = [];
+    if (pipelines.length === 0) {
+      return res.json({
+        success: true,
+        opportunities: [],
+        total: 0,
+        message: 'No pipelines found'
+      });
+    }
     
-    for (let i = 0; i < opportunities.length; i += batchSize) {
-      const batch = opportunities.slice(i, i + batchSize);
+    // Step 2: Get opportunities from each pipeline
+    let allOpportunities = [];
+    
+    // Determine which pipelines to query
+    const pipelinesToQuery = pipelineId && pipelineId !== 'all' 
+      ? pipelines.filter(p => p.id === pipelineId)
+      : pipelines;
+    
+    console.log(`Querying ${pipelinesToQuery.length} pipelines`);
+    
+    for (const pipeline of pipelinesToQuery) {
+      try {
+        console.log(`Fetching opportunities for pipeline: ${pipeline.name} (${pipeline.id})`);
+        
+        // Use the pipeline-specific endpoint
+        const oppUrl = `https://services.leadconnectorhq.com/opportunities/pipelines/${pipeline.id}`;
+        
+        const oppResponse = await axios.get(oppUrl, {
+          headers: {
+            Authorization: `Bearer ${HIGHLEVEL_API_KEY}`,
+            Version: '2021-07-28',
+          },
+        });
+        
+        // The response should have pipeline data with opportunities
+        const pipelineData = oppResponse.data.pipeline || oppResponse.data;
+        console.log(`Pipeline response structure:`, Object.keys(pipelineData));
+        
+        // Try to extract opportunities from different possible structures
+        let opportunities = [];
+        
+        if (pipelineData.opportunities) {
+          opportunities = pipelineData.opportunities;
+        } else if (pipelineData.stages) {
+          // Extract opportunities from stages
+          pipelineData.stages.forEach(stage => {
+            if (stage.opportunities) {
+              opportunities.push(...stage.opportunities);
+            }
+          });
+        } else if (Array.isArray(pipelineData)) {
+          opportunities = pipelineData;
+        }
+        
+        console.log(`Found ${opportunities.length} opportunities in ${pipeline.name}`);
+        
+        // Add pipeline info to each opportunity
+        opportunities = opportunities.map(opp => ({
+          ...opp,
+          pipelineName: pipeline.name,
+          pipelineId: pipeline.id,
+        }));
+        
+        allOpportunities.push(...opportunities);
+        
+      } catch (pipelineError) {
+        console.error(`Error getting opportunities for pipeline ${pipeline.name}:`, pipelineError.message);
+        console.error('Error details:', pipelineError.response?.data);
+        // Continue with next pipeline
+      }
+    }
+    
+    console.log(`Total opportunities before filtering: ${allOpportunities.length}`);
+    
+    // Step 3: Filter by status if requested
+    if (status && status !== 'all') {
+      allOpportunities = allOpportunities.filter(opp => 
+        opp.status?.toLowerCase() === status.toLowerCase()
+      );
+      console.log(`After status filter (${status}): ${allOpportunities.length}`);
+    }
+    
+    // Step 4: Limit results
+    const limitedOpps = allOpportunities.slice(0, parseInt(limit));
+    
+    // Step 5: Enrich with contact details (in batches to avoid rate limits)
+    const enrichedOpportunities = [];
+    const batchSize = 3;
+    
+    for (let i = 0; i < limitedOpps.length; i += batchSize) {
+      const batch = limitedOpps.slice(i, i + batchSize);
       
       const batchResults = await Promise.all(
         batch.map(async (opp) => {
           try {
-            if (opp.contact && opp.contact.email && opp.contact.phone) {
-              const { data: analysis } = await supabase
-                .from('analyses')
-                .select('id')
-                .eq('contact_id', opp.contact.id)
-                .limit(1)
-                .single();
+            // Get contact details if not already present
+            let contactData = opp.contact || {};
+            
+            if (!contactData.email || !contactData.phone) {
+              const contactResponse = await axios.get(
+                `https://services.leadconnectorhq.com/contacts/${opp.contactId || opp.contact?.id}`,
+                {
+                  headers: {
+                    Authorization: `Bearer ${HIGHLEVEL_API_KEY}`,
+                    Version: '2021-07-28',
+                  },
+                }
+              );
               
-              return {
-                id: opp.id,
-                name: opp.name,
-                pipelineId: opp.pipelineId,
-                pipelineStageId: opp.pipelineStageId,
-                status: opp.status,
-                monetaryValue: opp.monetaryValue,
-                assignedTo: opp.assignedTo,
-                contact: {
-                  id: opp.contact.id,
-                  name: opp.contact.name || 'Unknown',
-                  email: opp.contact.email,
-                  phone: opp.contact.phone,
-                },
-                hasAnalysis: !!analysis,
-                createdAt: opp.createdAt,
-                lastStatusChangeAt: opp.lastStatusChangeAt,
+              const contact = contactResponse.data.contact;
+              contactData = {
+                id: contact.id,
+                name: `${contact.firstName || ''} ${contact.lastName || ''}`.trim(),
+                email: contact.email,
+                phone: contact.phone,
+              };
+            } else {
+              contactData = {
+                id: contactData.id,
+                name: contactData.name || `${contactData.firstName || ''} ${contactData.lastName || ''}`.trim(),
+                email: contactData.email,
+                phone: contactData.phone,
               };
             }
             
-            const contactResponse = await axios.get(
-              `https://services.leadconnectorhq.com/contacts/${opp.contact.id}`,
-              {
-                headers: {
-                  Authorization: `Bearer ${HIGHLEVEL_API_KEY}`,
-                  Version: '2021-07-28',
-                },
-              }
-            );
-            
-            const contact = contactResponse.data.contact;
-            
+            // Check if has analysis
             const { data: analysis } = await supabase
               .from('analyses')
               .select('id')
-              .eq('contact_id', opp.contact.id)
+              .eq('contact_id', contactData.id)
               .limit(1)
               .single();
             
             return {
               id: opp.id,
-              name: opp.name,
+              name: opp.name || opp.title || 'Untitled',
               pipelineId: opp.pipelineId,
-              pipelineStageId: opp.pipelineStageId,
+              pipelineName: opp.pipelineName,
+              pipelineStageId: opp.pipelineStageId || opp.stageId,
               status: opp.status,
-              monetaryValue: opp.monetaryValue,
+              monetaryValue: opp.monetaryValue || opp.value,
               assignedTo: opp.assignedTo,
-              contact: {
-                id: contact.id,
-                name: `${contact.firstName || ''} ${contact.lastName || ''}`.trim(),
-                email: contact.email,
-                phone: contact.phone,
-              },
+              contact: contactData,
               hasAnalysis: !!analysis,
-              createdAt: opp.createdAt,
-              lastStatusChangeAt: opp.lastStatusChangeAt,
+              createdAt: opp.createdAt || opp.dateAdded,
+              lastStatusChangeAt: opp.lastStatusChangeAt || opp.lastUpdated,
             };
           } catch (err) {
-            console.error(`Error processing opportunity ${opp.id}:`, err.message);
+            console.error(`Error enriching opportunity ${opp.id}:`, err.message);
             return {
               id: opp.id,
-              name: opp.name,
+              name: opp.name || 'Unknown',
               pipelineId: opp.pipelineId,
-              pipelineStageId: opp.pipelineStageId,
+              pipelineName: opp.pipelineName,
               status: opp.status,
-              monetaryValue: opp.monetaryValue,
-              assignedTo: opp.assignedTo,
               contact: {
-                id: opp.contact?.id || 'unknown',
-                name: opp.contact?.name || 'Unknown',
+                id: opp.contactId || opp.contact?.id || 'unknown',
+                name: 'Unknown',
                 email: null,
                 phone: null,
               },
               hasAnalysis: false,
-              createdAt: opp.createdAt,
-              lastStatusChangeAt: opp.lastStatusChangeAt,
             };
           }
         })
       );
       
-      opportunitiesWithContacts.push(...batchResults);
+      enrichedOpportunities.push(...batchResults);
     }
     
     res.json({
       success: true,
-      opportunities: opportunitiesWithContacts,
-      total: response.data.meta?.total || opportunitiesWithContacts.length,
-      nextStartAfterId: response.data.meta?.nextStartAfterId || null,
-      nextStartAfter: response.data.meta?.nextStartAfterId || null,
+      opportunities: enrichedOpportunities,
+      total: allOpportunities.length,
+      returned: enrichedOpportunities.length,
     });
+    
   } catch (error) {
     console.error('Error getting opportunities:', error.message);
-    console.error('Error details:', error.response?.data || error);
+    console.error('Full error:', error.response?.data || error);
     res.status(500).json({
       success: false,
       error: error.message,
