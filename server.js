@@ -1107,8 +1107,10 @@ app.post('/api/analyze-contact', async (req, res) => {
       	console.log(`Conversation ${conv.id}: found ${messages.length} messages`);
       
       for (const msg of messages) {
-       console.log(`Message type: ${msg.type || msg.messageType}, body: ${msg.body?.substring(0, 50)}...`);
-	 if (msg.type === 'TYPE_CALL' && includeCalls) {
+        const messageType = msg.type || msg.messageType;
+        console.log(`Message type: ${messageType}, body: ${msg.body?.substring(0, 50)}...`);
+        
+        if ((messageType === 'TYPE_CALL' || messageType === 1) && includeCalls) {
           try {
             const recordingUrl = `https://services.leadconnectorhq.com/conversations/messages/${msg.id}/locations/${HIGHLEVEL_LOCATION_ID}/recording`;
             
@@ -1147,18 +1149,24 @@ app.post('/api/analyze-contact', async (req, res) => {
           } catch (err) {
             console.error(`Error transcribing call ${msg.id}:`, err.message);
           }
-        } else if (msg.type === 'TYPE_SMS' && includeSMS) {
+        } else if ((messageType === 'TYPE_SMS' || messageType === 2) && includeSMS) {
           allMessages.push({
             type: 'SMS',
             content: msg.body,
             direction: msg.direction,
             date: msg.dateAdded,
           });
-        } else if ((msg.type === 'TYPE_WHATSAPP' || !msg.type) && includeWhatsApp) {
+        } else if ((messageType === 'TYPE_WHATSAPP' || messageType === 19) && includeWhatsApp) {
           allMessages.push({
             type: 'WHATSAPP',
             content: msg.body,
             direction: msg.direction,
+            date: msg.dateAdded,
+          });
+        } else if (messageType === 37) {
+          allMessages.push({
+            type: 'INTERNAL_NOTE',
+            content: msg.body,
             date: msg.dateAdded,
           });
         }
