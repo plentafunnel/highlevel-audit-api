@@ -1291,6 +1291,35 @@ app.get('/api/analyses/:contactId/latest', async (req, res) => {
   }
 });
 
+
+app.get('/api/analyses/:contactId/types', async (req, res) => {
+  try {
+    const { data: analyses, error } = await supabase
+      .from('analyses')
+      .select('prompt_type')
+      .eq('contact_id', req.params.contactId);
+    
+    if (error) throw error;
+    
+    const types = {
+      hasSetter: analyses.some(a => a.prompt_type === 'setter'),
+      hasCloser: analyses.some(a => a.prompt_type === 'closer'),
+      total: analyses.length,
+    };
+    
+    res.json({
+      success: true,
+      ...types,
+    });
+  } catch (error) {
+    console.error('Error checking analysis types:', error.message);
+    res.status(500).json({
+      success: false,
+      error: error.message,
+    });
+  }
+});
+
 app.get('/api/analyses/:contactId', async (req, res) => {
   try {
     const { data: analyses, error } = await supabase
