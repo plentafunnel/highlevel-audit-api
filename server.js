@@ -1107,7 +1107,8 @@ app.post('/api/analyze-contact', async (req, res) => {
       	console.log(`Conversation ${conv.id}: found ${messages.length} messages`);
       
       for (const msg of messages) {
-        if (msg.type === 'TYPE_CALL' && includeCalls) {
+       console.log(`Message type: ${msg.type || msg.messageType}, body: ${msg.body?.substring(0, 50)}...`);
+	 if (msg.type === 'TYPE_CALL' && includeCalls) {
           try {
             const recordingUrl = `https://services.leadconnectorhq.com/conversations/messages/${msg.id}/locations/${HIGHLEVEL_LOCATION_ID}/recording`;
             
@@ -1165,7 +1166,9 @@ app.post('/api/analyze-contact', async (req, res) => {
     }
     
     console.log('Step 4/4: Running AI analysis...');
-	
+
+    let contextParts = [];	
+
     console.log('📊 Context summary:');
     console.log('- Contact ID:', contactId);
     console.log('- Contact name:', `${contact.firstName} ${contact.lastName}`);
@@ -1175,8 +1178,6 @@ app.post('/api/analyze-contact', async (req, res) => {
     console.log('- Context parts:', contextParts.length);
     console.log('- Full context length:', fullContext.length, 'characters');
     console.log('📝 Sending to Claude...');    
-
-    let contextParts = [];
     
     if (prompt.settings.includeContactInfo) {
       contextParts.push(`**INFORMACIÓN DEL CONTACTO:**
