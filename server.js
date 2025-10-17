@@ -41,11 +41,11 @@ app.get('/health', (req, res) => {
   res.json({ 
     status: 'ok',
     message: 'HighLevel Audit API is running',
-    version: '2.6.0',
+    version: '2.7.0',
     database: 'Supabase PostgreSQL',
     features: [
       'contacts',
-      'opportunities-with-pagination',
+      'opportunities-optimized',
       'conversations', 
       'transcriptions',
       'chat',
@@ -55,7 +55,7 @@ app.get('/health', (req, res) => {
       'full-contact-analysis',
       'persistent-storage',
       'setter-closer-prompts',
-      'pipeline-filtering'
+      'pipeline-filtering-optimized'
     ]
   });
 });
@@ -307,56 +307,98 @@ app.get('/api/opportunities', async (req, res) => {
     }
     
     let allOpportunities = [];
-    let hasMore = true;
-    let nextPageUrl = null;
     
     try {
-      console.log('Fetching all opportunities with pagination...');
-      
-      while (hasMore) {
-        const searchParams = {
-          location_id: HIGHLEVEL_LOCATION_ID,
-          limit: 100,
-        };
+      // If filtering by specific pipeline, use direct endpoint (MUCH faster)
+      if (pipelineId && pipelineId !== 'all') {
+        console.log(`Fetching opportunities from pipeline ${pipelineId} (direct endpoint)...`);
         
-        if (status && status !== 'all') {
-          searchParams.status = status;
-        }
-        
-        const url = nextPageUrl || 'https://services.leadconnectorhq.com/opportunities/search';
-        
-        const response = await axios.get(url, {
+        const oppUrl = `https://services.leadconnectorhq.com/opportunities/pipelines/${pipelineId}`;
+        const oppResponse = await axios.get(oppUrl, {
           headers: {
             Authorization: `Bearer ${HIGHLEVEL_API_KEY}`,
             Version: '2021-07-28',
           },
-          params: nextPageUrl ? {} : searchParams,
         });
         
-        const opportunities = response.data.opportunities || [];
-        allOpportunities.push(...opportunities);
+        const pipelineData = oppResponse.data.pipeline || oppResponse.data;
         
-        console.log(`Fetched ${opportunities.length} opportunities (total: ${allOpportunities.length})`);
+        if (pipelineData.opportunities) {
+          allOpportunities = pipelineData.opportunities;
+        } else if (pipelineData.stages) {
+          pipelineData.stages.forEach(stage => {
+            if (stage.opportunities) {
+              allOpportunities.push(...stage.opportunities);
+            }
+          });
+        }
         
-        nextPageUrl = response.data.meta?.nextPageUrl || null;
-        hasMore = nextPageUrl !== null;
-      }
-      
-      console.log(`Got ${allOpportunities.length} total opportunities`);
-      
-      if (pipelineId && pipelineId !== 'all') {
-        allOpportunities = allOpportunities.filter(opp => opp.pipelineId === pipelineId);
-        console.log(`After pipeline filter: ${allOpportunities.length} opportunities`);
-      }
-      
-      if (pipelineStageId && pipelineStageId !== 'all') {
-        allOpportunities = allOpportunities.filter(opp => opp.pipelineStageId === pipelineStageId);
-        console.log(`After stage filter: ${allOpportunities.length} opportunities`);
+        console.log(`Got ${allOpportunities.length} opportunities from pipeline`);
+        
+        // Filter by stage if specified
+        if (pipelineStageId && pipelineStageId !== 'all') {
+          allOpportunities = allOpportunities.filter(opp => opp.pipelineStageId === pipelineStageId);
+          console.log(`After stage filter: ${allOpportunities.length} opportunities`);
+        }
+        
+        // Filter by status if specified
+        if (status && status !== 'all') {
+          allOpportunities = allOpportunities.filter(opp => opp.status?.toLowerCase() === status.toLowerCase());
+          console.log(`After status filter: ${allOpportunities.length} opportunities`);
+        }
+        
+      } else {
+        // No pipeline filter - fetch all with pagination (slower)
+        console.log('Fetching all opportunities with pagination...');
+        
+        let hasMore = true;
+        let nextPageUrl = null;
+        
+        while (hasMore && allOpportunities.length < 500) {
+          const searchParams = {
+            location_id: HIGHLEVEL_LOCATION_ID,
+            limit: 100,
+          };
+          
+          if (status && status !== 'all') {
+            searchParams.status = status;
+          }
+          
+          const url = nextPageUrl || 'https://services.leadconnectorhq.com/opportunities/search';
+          
+          const response = await axios.get(url, {
+            headers: {
+              Authorization: `Bearer ${HIGHLEVEL_API_KEY}`,
+              Version: '2021-07-28',
+            },
+            params: nextPageUrl ? {} : searchParams,
+          });
+          
+          const opportunities = response.data.opportunities || [];
+          
+          if (opportunities.length === 0) {
+            console.log('No more opportunities to fetch');
+            break;
+          }
+          
+          allOpportunities.push(...opportunities);
+          
+          console.log(`Fetched ${opportunities.length} opportunities (total: ${allOpportunities.length})`);
+          
+          const currentUrl = url;
+          nextPageUrl = response.data.meta?.nextPageUrl || null;
+          hasMore = nextPageUrl !== null && nextPageUrl !== currentUrl;
+        }
+        
+        console.log(`Got ${allOpportunities.length} total opportunities`);
       }
       
     } catch (searchError) {
       console.error('Error fetching opportunities:', searchError.message);
-      console.log('Trying pipeline-by-pipeline approach...');
+      
+      // Fallback: try pipeline-by-pipeline
+      console.log('Trying pipeline-by-pipeline fallback...');
+      allOpportunities = [];
       
       for (const pipeline of pipelines) {
         try {
@@ -368,8 +410,6 @@ app.get('/api/opportunities', async (req, res) => {
               Version: '2021-07-28',
             },
           });
-          
-          console.log(`Response structure for ${pipeline.name}:`, Object.keys(oppResponse.data));
           
           const pipelineData = oppResponse.data.pipeline || oppResponse.data;
           let opportunities = [];
@@ -399,12 +439,6 @@ app.get('/api/opportunities', async (req, res) => {
     }
     
     console.log(`Total opportunities found: ${allOpportunities.length}`);
-    
-    if (status && status !== 'all') {
-      allOpportunities = allOpportunities.filter(opp => 
-        opp.status?.toLowerCase() === status.toLowerCase()
-      );
-    }
     
     const limitedOpps = allOpportunities.slice(0, parseInt(limit));
     
@@ -499,6 +533,7 @@ app.get('/api/opportunities', async (req, res) => {
       opportunities: enrichedOpportunities,
       total: allOpportunities.length,
       returned: enrichedOpportunities.length,
+      optimized: pipelineId && pipelineId !== 'all',
     });
     
   } catch (error) {
@@ -1632,14 +1667,14 @@ app.post('/api/chat-mcp', async (req, res) => {
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, '0.0.0.0', () => {
-  console.log(`🚀 HighLevel Audit API v2.6 running on port ${PORT}`);
+  console.log(`🚀 HighLevel Audit API v2.7 running on port ${PORT}`);
   console.log(`📍 Health: http://localhost:${PORT}/health`);
   console.log(`💾 Database: Supabase PostgreSQL`);
   console.log(`🎯 Features:`);
   console.log(`   - Persistent storage with Supabase`);
   console.log(`   - Dual prompts management (Setter/Closer)`);
   console.log(`   - Full contact analysis`);
-  console.log(`   - Opportunities with pagination and filtering`);
+  console.log(`   - Opportunities with optimized pipeline filtering`);
   console.log(`   - MCP-enabled intelligent chat`);
   console.log(`   - Contacts caching`);
   console.log(`   - Analysis history by type`);
