@@ -1115,6 +1115,7 @@ app.post('/api/analyze-contact', async (req, res) => {
       .from('analyses')
       .insert({
         contact_id: contactId,
+        user_id: 'system',
         contact_name: `${contact.firstName} ${contact.lastName}`,
         prompt_version: prompt.version,
         prompt_id: prompt.id,
