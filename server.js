@@ -1009,7 +1009,10 @@ app.post('/api/analyze-contact', async (req, res) => {
         }
       );
       
-      const messages = messagesResponse.data.messages || [];
+	const messagesData = messagesResponse.data.messages || {};
+      	const messages = messagesData.messages || [];
+ 
+      	console.log(`Conversation ${conv.id}: found ${messages.length} messages`);
       
       for (const msg of messages) {
         if (msg.type === 'TYPE_CALL' && includeCalls) {
