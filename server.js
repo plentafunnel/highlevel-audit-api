@@ -309,88 +309,66 @@ app.get('/api/opportunities', async (req, res) => {
     let allOpportunities = [];
     
     try {
-      // If filtering by specific pipeline, use direct endpoint (MUCH faster)
-      if (pipelineId && pipelineId !== 'all') {
-        console.log(`Fetching opportunities from pipeline ${pipelineId} (direct endpoint)...`);
+      // Always use pagination, then filter in backend
+      console.log('Fetching all opportunities with pagination...');
+
+      let hasMore = true;
+      let nextPageUrl = null;
+
+      while (hasMore && allOpportunities.length < 1000) {
+        const searchParams = {
+          location_id: HIGHLEVEL_LOCATION_ID,
+          limit: 100,
+        };
         
-        const oppUrl = `https://services.leadconnectorhq.com/opportunities/pipelines/${pipelineId}`;
-        const oppResponse = await axios.get(oppUrl, {
+        if (status && status !== 'all') {
+          searchParams.status = status;
+        }
+        
+        const url = nextPageUrl || 'https://services.leadconnectorhq.com/opportunities/search';
+        
+        const response = await axios.get(url, {
           headers: {
             Authorization: `Bearer ${HIGHLEVEL_API_KEY}`,
             Version: '2021-07-28',
           },
+          params: nextPageUrl ? {} : searchParams,
         });
         
-        const pipelineData = oppResponse.data.pipeline || oppResponse.data;
+        const opportunities = response.data.opportunities || [];
         
-        if (pipelineData.opportunities) {
-          allOpportunities = pipelineData.opportunities;
-        } else if (pipelineData.stages) {
-          pipelineData.stages.forEach(stage => {
-            if (stage.opportunities) {
-              allOpportunities.push(...stage.opportunities);
-            }
-          });
-        }
+        if (opportunities.length === 0) break;
         
-        console.log(`Got ${allOpportunities.length} opportunities from pipeline`);
+        allOpportunities.push(...opportunities);
         
-        // Filter by stage if specified
-        if (pipelineStageId && pipelineStageId !== 'all') {
-          allOpportunities = allOpportunities.filter(opp => opp.pipelineStageId === pipelineStageId);
-          console.log(`After stage filter: ${allOpportunities.length} opportunities`);
-        }
+        console.log(`Fetched ${opportunities.length} opportunities (total: ${allOpportunities.length})`);
         
-        // Filter by status if specified
-        if (status && status !== 'all') {
-          allOpportunities = allOpportunities.filter(opp => opp.status?.toLowerCase() === status.toLowerCase());
-          console.log(`After status filter: ${allOpportunities.length} opportunities`);
-        }
+        const currentUrl = url;
+        nextPageUrl = response.data.meta?.nextPageUrl || null;
+        hasMore = nextPageUrl !== null && nextPageUrl !== currentUrl;
         
-      } else {
-        // No pipeline filter - fetch all with pagination (slower)
-        console.log('Fetching all opportunities with pagination...');
-        
-        let hasMore = true;
-        let nextPageUrl = null;
-        
-        while (hasMore && allOpportunities.length < 500) {
-          const searchParams = {
-            location_id: HIGHLEVEL_LOCATION_ID,
-            limit: 100,
-          };
-          
-          if (status && status !== 'all') {
-            searchParams.status = status;
-          }
-          
-          const url = nextPageUrl || 'https://services.leadconnectorhq.com/opportunities/search';
-          
-          const response = await axios.get(url, {
-            headers: {
-              Authorization: `Bearer ${HIGHLEVEL_API_KEY}`,
-              Version: '2021-07-28',
-            },
-            params: nextPageUrl ? {} : searchParams,
-          });
-          
-          const opportunities = response.data.opportunities || [];
-          
-          if (opportunities.length === 0) {
-            console.log('No more opportunities to fetch');
+        // Early exit if we have enough for this specific pipeline
+        if (pipelineId && pipelineId !== 'all') {
+          const filtered = allOpportunities.filter(opp => opp.pipelineId === pipelineId);
+          if (filtered.length >= parseInt(limit) * 2) {
+            console.log('Early exit: found enough opportunities for pipeline');
             break;
           }
-          
-          allOpportunities.push(...opportunities);
-          
-          console.log(`Fetched ${opportunities.length} opportunities (total: ${allOpportunities.length})`);
-          
-          const currentUrl = url;
-          nextPageUrl = response.data.meta?.nextPageUrl || null;
-          hasMore = nextPageUrl !== null && nextPageUrl !== currentUrl;
         }
-        
-        console.log(`Got ${allOpportunities.length} total opportunities`);
+      }
+
+      console.log(`Got ${allOpportunities.length} total opportunities`);
+
+      // Filter by pipeline
+      if (pipelineId && pipelineId !== 'all') {
+        allOpportunities = allOpportunities.filter(opp => opp.pipelineId === pipelineId);
+        console.log(`After pipeline filter: ${allOpportunities.length} opportunities`);
+      }
+
+      // Filter by stage
+      if (pipelineStageId && pipelineStageId !== 'all') {
+        allOpportunities = allOpportunities.filter(opp => opp.pipelineStageId === pipelineStageId);
+        console.log(`After stage filter: ${allOpportunities.length} opportunities`);
       }
       
     } catch (searchError) {
