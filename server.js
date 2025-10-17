@@ -1165,7 +1165,17 @@ app.post('/api/analyze-contact', async (req, res) => {
     }
     
     console.log('Step 4/4: Running AI analysis...');
-    
+	
+    console.log('📊 Context summary:');
+    console.log('- Contact ID:', contactId);
+    console.log('- Contact name:', `${contact.firstName} ${contact.lastName}`);
+    console.log('- Total conversations:', conversations.length);
+    console.log('- Total messages collected:', allMessages.length);
+    console.log('- Total transcriptions:', transcriptions.length);
+    console.log('- Context parts:', contextParts.length);
+    console.log('- Full context length:', fullContext.length, 'characters');
+    console.log('📝 Sending to Claude...');    
+
     let contextParts = [];
     
     if (prompt.settings.includeContactInfo) {
