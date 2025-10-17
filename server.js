@@ -1184,7 +1184,6 @@ app.post('/api/analyze-contact', async (req, res) => {
     console.log('- Total messages collected:', allMessages.length);
     console.log('- Total transcriptions:', transcriptions.length);
     console.log('- Context parts:', contextParts.length);
-    console.log('- Full context length:', fullContext.length, 'characters');
     console.log('📝 Sending to Claude...');    
     
     if (prompt.settings.includeContactInfo) {
