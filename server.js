@@ -305,75 +305,56 @@ app.get('/api/opportunities', async (req, res) => {
     }
     
     let allOpportunities = [];
+    let hasMore = true;
+    let nextPageUrl = null;
     
     try {
-      console.log('Attempting to fetch opportunities with location_id (snake_case)...');
+      console.log('Fetching all opportunities with pagination...');
       
-      const searchParams = {
-        location_id: HIGHLEVEL_LOCATION_ID,
-        limit: parseInt(limit),
-      };
-      
-      if (pipelineId && pipelineId !== 'all') {
-        searchParams.pipelineId = pipelineId;
-      }
-      
-      if (status && status !== 'all') {
-        searchParams.status = status;
-      }
-      
-      console.log('Search params:', searchParams);
-      
-      const searchResponse = await axios.get(
-        'https://services.leadconnectorhq.com/opportunities/search',
-        {
-          headers: {
-            Authorization: `Bearer ${HIGHLEVEL_API_KEY}`,
-            Version: '2021-07-28',
-          },
-          params: searchParams,
-        }
-      );
-      
-      allOpportunities = searchResponse.data.opportunities || [];
-      console.log(`Got ${allOpportunities.length} opportunities from search endpoint with location_id`);
-      
-    } catch (searchError) {
-      console.error('Search with location_id failed:', searchError.message);
-      console.log('Trying with locationId (camelCase)...');
-      
-      try {
+      while (hasMore) {
         const searchParams = {
-          locationId: HIGHLEVEL_LOCATION_ID,
-          limit: parseInt(limit),
+          location_id: HIGHLEVEL_LOCATION_ID,
+          limit: 100,
         };
-        
-        if (pipelineId && pipelineId !== 'all') {
-          searchParams.pipelineId = pipelineId;
-        }
         
         if (status && status !== 'all') {
           searchParams.status = status;
         }
         
-        console.log('Search params (camelCase):', searchParams);
+        const url = nextPageUrl || 'https://services.leadconnectorhq.com/opportunities/search';
         
-        const searchResponse = await axios.get(
-          'https://services.leadconnectorhq.com/opportunities/search',
-          {
-            headers: {
-              Authorization: `Bearer ${HIGHLEVEL_API_KEY}`,
-              Version: '2021-07-28',
-            },
-            params: searchParams,
-          }
-        );
+        const response = await axios.get(url, {
+          headers: {
+            Authorization: `Bearer ${HIGHLEVEL_API_KEY}`,
+            Version: '2021-07-28',
+          },
+          params: nextPageUrl ? {} : searchParams,
+        });
         
-        allOpportunities = searchResponse.data.opportunities || [];
-        console.log(`Got ${allOpportunities.length} opportunities with camelCase locationId`);
+        const opportunities = response.data.opportunities || [];
+        allOpportunities.push(...opportunities);
         
-      } catch (camelCaseError) {
-        console.error('Both formats failed. Trying pipeline-by-pipeline approach...');
+        console.log(`Fetched ${opportunities.length} opportunities (total: ${allOpportunities.length})`);
+        
+        nextPageUrl = response.data.meta?.nextPageUrl || null;
+        hasMore = nextPageUrl !== null;
+      }
+      
+      console.log(`Got ${allOpportunities.length} total opportunities`);
+      
+      if (pipelineId && pipelineId !== 'all') {
+        allOpportunities = allOpportunities.filter(opp => opp.pipelineId === pipelineId);
+        console.log(`After pipeline filter: ${allOpportunities.length} opportunities`);
+      }
+      
+      if (pipelineStageId && pipelineStageId !== 'all') {
+        allOpportunities = allOpportunities.filter(opp => opp.pipelineStageId === pipelineStageId);
+        console.log(`After stage filter: ${allOpportunities.length} opportunities`);
+      }
+      
+    } catch (searchError) {
+      console.error('Error fetching opportunities:', searchError.message);
+      console.log('Trying pipeline-by-pipeline approach...');
         
         for (const pipeline of pipelines) {
           try {
