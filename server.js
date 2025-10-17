@@ -277,10 +277,70 @@ app.get('/api/opportunities', async (req, res) => {
       pipelineStageId,
       status,
       limit = 100,
+      refresh = 'false',
     } = req.query;
     
-    console.log('Getting opportunities with filters:', { pipelineId, pipelineStageId, status, limit });
+    console.log('Getting opportunities with filters:', { pipelineId, pipelineStageId, status, limit, refresh });
     
+    // Check cache first (unless refresh is requested)
+    if (refresh !== 'true') {
+      console.log('Checking cache...');
+      
+      let cacheQuery = supabase
+        .from('opportunities_cache')
+        .select('*')
+        .order('last_synced', { ascending: false });
+      
+      if (pipelineId && pipelineId !== 'all') {
+        cacheQuery = cacheQuery.eq('pipeline_id', pipelineId);
+      }
+      
+      if (pipelineStageId && pipelineStageId !== 'all') {
+        cacheQuery = cacheQuery.eq('pipeline_stage_id', pipelineStageId);
+      }
+      
+      if (status && status !== 'all') {
+        cacheQuery = cacheQuery.eq('status', status);
+      }
+      
+      const { data: cachedOpps, error: cacheError } = await cacheQuery.limit(parseInt(limit));
+      
+      if (!cacheError && cachedOpps && cachedOpps.length > 0) {
+        console.log(`Returning ${cachedOpps.length} opportunities from cache`);
+        
+        return res.json({
+          success: true,
+          opportunities: cachedOpps.map(opp => ({
+            id: opp.opportunity_id,
+            name: opp.name,
+            pipelineId: opp.pipeline_id,
+            pipelineName: opp.pipeline_name,
+            pipelineStageId: opp.pipeline_stage_id,
+            status: opp.status,
+            monetaryValue: opp.monetary_value,
+            contact: {
+              id: opp.contact_id,
+              name: opp.contact_name,
+              email: opp.contact_email,
+              phone: opp.contact_phone,
+            },
+            hasAnalysis: opp.has_analysis,
+            createdAt: opp.data?.createdAt,
+            lastStatusChangeAt: opp.data?.lastStatusChangeAt,
+          })),
+          total: cachedOpps.length,
+          returned: cachedOpps.length,
+          cached: true,
+          lastSync: cachedOpps[0]?.last_synced,
+        });
+      }
+      
+      console.log('No cache found or cache empty, fetching from HighLevel...');
+    } else {
+      console.log('Refresh requested, bypassing cache...');
+    }
+    
+    // Fetch from HighLevel (same as before)
     const pipelinesResponse = await axios.get(
       `https://services.leadconnectorhq.com/opportunities/pipelines`,
       {
@@ -302,14 +362,14 @@ app.get('/api/opportunities', async (req, res) => {
         success: true,
         opportunities: [],
         total: 0,
-        message: 'No pipelines found'
+        message: 'No pipelines found',
+        cached: false,
       });
     }
     
     let allOpportunities = [];
     
     try {
-      // Always use pagination, then filter in backend
       console.log('Fetching all opportunities with pagination...');
 
       let hasMore = true;
@@ -347,7 +407,6 @@ app.get('/api/opportunities', async (req, res) => {
         nextPageUrl = response.data.meta?.nextPageUrl || null;
         hasMore = nextPageUrl !== null && nextPageUrl !== currentUrl;
         
-        // Early exit if we have enough for this specific pipeline
         if (pipelineId && pipelineId !== 'all') {
           const filtered = allOpportunities.filter(opp => opp.pipelineId === pipelineId);
           if (filtered.length >= parseInt(limit) * 2) {
@@ -359,13 +418,11 @@ app.get('/api/opportunities', async (req, res) => {
 
       console.log(`Got ${allOpportunities.length} total opportunities`);
 
-      // Filter by pipeline
       if (pipelineId && pipelineId !== 'all') {
         allOpportunities = allOpportunities.filter(opp => opp.pipelineId === pipelineId);
         console.log(`After pipeline filter: ${allOpportunities.length} opportunities`);
       }
 
-      // Filter by stage
       if (pipelineStageId && pipelineStageId !== 'all') {
         allOpportunities = allOpportunities.filter(opp => opp.pipelineStageId === pipelineStageId);
         console.log(`After stage filter: ${allOpportunities.length} opportunities`);
@@ -374,7 +431,6 @@ app.get('/api/opportunities', async (req, res) => {
     } catch (searchError) {
       console.error('Error fetching opportunities:', searchError.message);
       
-      // Fallback: try pipeline-by-pipeline
       console.log('Trying pipeline-by-pipeline fallback...');
       allOpportunities = [];
       
@@ -420,6 +476,7 @@ app.get('/api/opportunities', async (req, res) => {
     
     const limitedOpps = allOpportunities.slice(0, parseInt(limit));
     
+    // Enrich with contact data
     const enrichedOpportunities = [];
     const batchSize = 3;
     
@@ -506,12 +563,48 @@ app.get('/api/opportunities', async (req, res) => {
       enrichedOpportunities.push(...batchResults);
     }
     
+    // Save to cache
+    console.log('Saving to cache...');
+    const cacheData = enrichedOpportunities.map(opp => ({
+      opportunity_id: opp.id,
+      pipeline_id: opp.pipelineId,
+      pipeline_name: opp.pipelineName,
+      contact_id: opp.contact.id,
+      contact_name: opp.contact.name,
+      contact_email: opp.contact.email,
+      contact_phone: opp.contact.phone,
+      name: opp.name,
+      status: opp.status,
+      monetary_value: opp.monetaryValue,
+      pipeline_stage_id: opp.pipelineStageId,
+      has_analysis: opp.hasAnalysis,
+      data: {
+        createdAt: opp.createdAt,
+        lastStatusChangeAt: opp.lastStatusChangeAt,
+        assignedTo: opp.assignedTo,
+      },
+      last_synced: new Date().toISOString(),
+    }));
+    
+    if (cacheData.length > 0) {
+      const { error: cacheInsertError } = await supabase
+        .from('opportunities_cache')
+        .upsert(cacheData, { onConflict: 'opportunity_id' });
+      
+      if (cacheInsertError) {
+        console.error('Error saving to cache:', cacheInsertError.message);
+      } else {
+        console.log(`Cached ${cacheData.length} opportunities`);
+      }
+    }
+    
     res.json({
       success: true,
       opportunities: enrichedOpportunities,
       total: allOpportunities.length,
       returned: enrichedOpportunities.length,
-      optimized: pipelineId && pipelineId !== 'all',
+      cached: false,
+      synced: new Date().toISOString(),
     });
     
   } catch (error) {
@@ -524,7 +617,6 @@ app.get('/api/opportunities', async (req, res) => {
     });
   }
 });
-
 app.get('/api/opportunities/:opportunityId', async (req, res) => {
   try {
     const response = await axios.get(
