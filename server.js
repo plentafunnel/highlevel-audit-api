@@ -41,11 +41,11 @@ app.get('/health', (req, res) => {
   res.json({ 
     status: 'ok',
     message: 'HighLevel Audit API is running',
-    version: '2.5.0',
+    version: '2.6.0',
     database: 'Supabase PostgreSQL',
     features: [
       'contacts',
-      'opportunities',
+      'opportunities-with-pagination',
       'conversations', 
       'transcriptions',
       'chat',
@@ -54,7 +54,8 @@ app.get('/health', (req, res) => {
       'prompts-management-dual',
       'full-contact-analysis',
       'persistent-storage',
-      'setter-closer-prompts'
+      'setter-closer-prompts',
+      'pipeline-filtering'
     ]
   });
 });
@@ -273,11 +274,12 @@ app.get('/api/opportunities', async (req, res) => {
   try {
     const { 
       pipelineId, 
+      pipelineStageId,
       status,
       limit = 100,
     } = req.query;
     
-    console.log('Getting opportunities with filters:', { pipelineId, status, limit });
+    console.log('Getting opportunities with filters:', { pipelineId, pipelineStageId, status, limit });
     
     const pipelinesResponse = await axios.get(
       `https://services.leadconnectorhq.com/opportunities/pipelines`,
@@ -355,44 +357,43 @@ app.get('/api/opportunities', async (req, res) => {
     } catch (searchError) {
       console.error('Error fetching opportunities:', searchError.message);
       console.log('Trying pipeline-by-pipeline approach...');
-        
-        for (const pipeline of pipelines) {
-          try {
-            const oppUrl = `https://services.leadconnectorhq.com/opportunities/pipelines/${pipeline.id}`;
-            
-            const oppResponse = await axios.get(oppUrl, {
-              headers: {
-                Authorization: `Bearer ${HIGHLEVEL_API_KEY}`,
-                Version: '2021-07-28',
-              },
+      
+      for (const pipeline of pipelines) {
+        try {
+          const oppUrl = `https://services.leadconnectorhq.com/opportunities/pipelines/${pipeline.id}`;
+          
+          const oppResponse = await axios.get(oppUrl, {
+            headers: {
+              Authorization: `Bearer ${HIGHLEVEL_API_KEY}`,
+              Version: '2021-07-28',
+            },
+          });
+          
+          console.log(`Response structure for ${pipeline.name}:`, Object.keys(oppResponse.data));
+          
+          const pipelineData = oppResponse.data.pipeline || oppResponse.data;
+          let opportunities = [];
+          
+          if (pipelineData.opportunities) {
+            opportunities = pipelineData.opportunities;
+          } else if (pipelineData.stages) {
+            pipelineData.stages.forEach(stage => {
+              if (stage.opportunities) {
+                opportunities.push(...stage.opportunities);
+              }
             });
-            
-            console.log(`Response structure for ${pipeline.name}:`, Object.keys(oppResponse.data));
-            
-            const pipelineData = oppResponse.data.pipeline || oppResponse.data;
-            let opportunities = [];
-            
-            if (pipelineData.opportunities) {
-              opportunities = pipelineData.opportunities;
-            } else if (pipelineData.stages) {
-              pipelineData.stages.forEach(stage => {
-                if (stage.opportunities) {
-                  opportunities.push(...stage.opportunities);
-                }
-              });
-            }
-            
-            opportunities = opportunities.map(opp => ({
-              ...opp,
-              pipelineName: pipeline.name,
-              pipelineId: pipeline.id,
-            }));
-            
-            allOpportunities.push(...opportunities);
-            
-          } catch (pipelineError) {
-            console.error(`Error getting opportunities for ${pipeline.name}:`, pipelineError.message);
           }
+          
+          opportunities = opportunities.map(opp => ({
+            ...opp,
+            pipelineName: pipeline.name,
+            pipelineId: pipeline.id,
+          }));
+          
+          allOpportunities.push(...opportunities);
+          
+        } catch (pipelineError) {
+          console.error(`Error getting opportunities for ${pipeline.name}:`, pipelineError.message);
         }
       }
     }
@@ -1631,14 +1632,14 @@ app.post('/api/chat-mcp', async (req, res) => {
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, '0.0.0.0', () => {
-  console.log(`🚀 HighLevel Audit API v2.5 running on port ${PORT}`);
+  console.log(`🚀 HighLevel Audit API v2.6 running on port ${PORT}`);
   console.log(`📍 Health: http://localhost:${PORT}/health`);
   console.log(`💾 Database: Supabase PostgreSQL`);
   console.log(`🎯 Features:`);
   console.log(`   - Persistent storage with Supabase`);
   console.log(`   - Dual prompts management (Setter/Closer)`);
   console.log(`   - Full contact analysis`);
-  console.log(`   - Opportunities with flexible parameter handling`);
+  console.log(`   - Opportunities with pagination and filtering`);
   console.log(`   - MCP-enabled intelligent chat`);
   console.log(`   - Contacts caching`);
   console.log(`   - Analysis history by type`);
